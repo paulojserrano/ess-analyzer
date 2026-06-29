@@ -326,6 +326,29 @@ class AnalyzerApp:
         tk.Label(fb, text="Ctrl+O", bg=self.CARD, fg=self.SUBTLE,
                  font=("Segoe UI", 8)).pack(side="right", padx=(0, 2))
 
+        # ── Instructions panel ────────────────────────────────────────────────
+        info = tk.Frame(c, bg="#f1f5f9",
+                        highlightbackground=self.BORDER, highlightthickness=1)
+        info.pack(fill="x", pady=(6, 0))
+        _INSTRUCTIONS = (
+            ("File format",  "Excel (.xlsx) exported from the Hairobotics ASRS/ESS system."),
+            ("One per day",  "Each file represents one operational day. Add multiple files\n"
+                             "to compare days and unlock the cross-day Summary tab."),
+            ("Day label",    'Double-click the Day column to rename a file (e.g. "Mon", "Shift 2").'),
+            ("Config",       "Optional: place asrs_config.json next to the .xlsx to override\n"
+                             "station types, design rates, or robot type (K50 / A42)."),
+        )
+        for i, (heading, body) in enumerate(_INSTRUCTIONS):
+            row_bg = "#f1f5f9" if i % 2 == 0 else "#e8eef5"
+            row_f = tk.Frame(info, bg=row_bg)
+            row_f.pack(fill="x")
+            tk.Label(row_f, text=heading, bg=row_bg, fg=self.MUTED,
+                     font=("Segoe UI", 7, "bold"), width=11, anchor="nw",
+                     justify="left").pack(side="left", padx=(8, 4), pady=3)
+            tk.Label(row_f, text=body, bg=row_bg, fg=self.TEXT,
+                     font=("Segoe UI", 8), anchor="w", justify="left",
+                     wraplength=260).pack(side="left", padx=(0, 8), pady=3)
+
     def _build_stations_card(self, parent, row, col):
         tk = self.tk
 
