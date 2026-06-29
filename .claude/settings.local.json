@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python ai_codex.py)",
+      "Bash(python -c \"import cycle_time\")",
+      "Bash(python -c \"from analyses import cycle_time\")",
+      "Bash(python -m analyses.cycle_time)",
+      "Bash(python -c \"import plotly; print\\(plotly.__version__\\)\")",
+      "Bash(python -c \"import plotly.graph_objects as go\")",
+      "Bash(python -c \"import pandas as pd; s1 = pd.Series\\([1,2,3,4]\\); s2 = pd.Series\\([2,3,4,5]\\); print\\(s1.corr\\(s2, method='spearman'\\)\\)\")",
+      "Bash(python -c \"from analyses import cycle_time; print\\('OK'\\)\")",
+      "Bash(python -m py_compile analyses/throughput.py)",
+      "Bash(python -m py_compile analyses/dwell_time.py)",
+      "Bash(python -m py_compile analyses/switch_time.py)",
+      "Bash(python -m py_compile analyses/fleet_utilization.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(pip show:*)",
+      "Bash(pyinstaller ESS_Analyzer.spec --clean --noconfirm)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('analyses/dwell_time.py', encoding='utf-8'\\).read\\(\\)\\); print\\('dwell_time.py: OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py: OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('analyses/throughput.py', encoding='utf-8'\\).read\\(\\)\\); print\\('throughput.py: OK'\\)\")",
+      "Bash(python -c \"from analyses.dwell_time import _clipped_occupancy; print\\('Import OK, function signature:', _clipped_occupancy.__code__.co_varnames[:5]\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('analyses/throughput.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('analyses/dwell_time.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(rm -rf \"c:\\\\Users\\\\PauloSerrano\\\\OneDrive - hairobotics\\\\Documents\\\\Software Development\\\\Python Scripts\\\\ess_analyzer\\\\build\")",
+      "Bash(pyinstaller ESS_Analyzer.spec --noconfirm)",
+      "Bash(python -c \"import jaraco.text; print\\(jaraco.text.__file__\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('data_loader.py', doraise=True\\); py_compile.compile\\('app.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('analyses/throughput.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('app.py', doraise=True\\); py_compile.compile\\('analyses/dwell_time.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python3 -c ':*)",
+      "Bash(pyinstaller ESS_Analyzer.spec)"
+    ]
+  }
+}
