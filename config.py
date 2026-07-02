@@ -29,6 +29,14 @@ STAGE_LABEL_MAP: dict[str, str] = {
 # ── Column names ─────────────────────────────────────────────────────────────
 TOTAL_DURATION_COL = "任务全程耗时(秒)"
 
+# ── Switch-time model (shared by dwell, throughput, switch, summary) ─────────
+# Fallback robot handoff time used in implied-throughput formulas when the
+# actual release→arrived gap cannot be measured from the station sheet.
+SWITCH_S_FALLBACK = 6.0
+# A release→arrived gap longer than this is treated as starvation / idle time
+# (breaks, no demand, dispatch gaps) rather than an operational robot swap.
+MAX_OPERATIONAL_SWITCH_S = 300.0
+
 # ── AMR auto-detection hint: robot type name containing this string is treated
 #    as the delivery AMR (K50 equivalent).  Override via asrs_config.json. ───
 AMR_DELIVERY_TYPE_HINT = "50"
@@ -37,10 +45,16 @@ AMR_DELIVERY_TYPE_HINT = "50"
 ANALYSIS_MODULES: list[tuple[str, str]] = [
     ("throughput", "Throughput per station / hour"),
     ("dwell",      "Dwell / pick time"),
-    ("switch",     "Switch time"),
+    ("switch",     "Switch time & starvation"),
+    ("readiness",  "Station readiness (ppReady)"),
     # ("cycle",      "Cycle time  (lifecycle sheet)"),  # temporarily disabled
+    ("backlog",    "Allocation wait & backlog  (lifecycle sheet)"),
     ("retrieval",  "Retrieval demand  (lifecycle sheet)"),
     ("fleet",      "Fleet utilisation & queue depth  (lifecycle + station)"),
+    ("robot",      "Per-robot performance"),
+    ("returns",    "Outbound vs return flow"),
+    ("efficiency", "HPS3 bottleneck attribution  (efficiency sheet)"),
+    ("quality",    "Data quality & cross-validation"),
 ]
 
 # Analyses checked by default in the GUI

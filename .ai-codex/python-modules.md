@@ -1,7 +1,7 @@
 # Python Modules Map (generated 2026-07-01)
 # Root-level modules: classes, methods, top-level functions
 
-## app.py  (1867 lines)
+## app.py  (1889 lines)
    app.py — Tkinter GUI for the ESS / ASRS Log Analyser.
 
    class AnalyzerApp
@@ -60,10 +60,10 @@
      def _run_headless                (path: str)
      def main                         ()
 
-## config.py  (47 lines)
+## config.py  (61 lines)
    config.py — Single source of truth for all constants and palette definitions.
 
-## data_loader.py  (591 lines)
+## data_loader.py  (598 lines)
    data_loader.py — Excel ingestion, sheet-signature detection, and runtime config
 
    class ValidationResult

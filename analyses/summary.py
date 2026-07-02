@@ -22,7 +22,15 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from config import ACCENT, INK, TOTAL_DURATION_COL
+from config import (
+    ACCENT,
+    INK,
+    MAX_OPERATIONAL_SWITCH_S,
+    SWITCH_S_FALLBACK,
+    TOTAL_DURATION_COL,
+)
+from analyses.dwell_time import extract_picks
+from analyses.switch_time import _release_arrived_gaps
 
 # One distinct colour per day (cycles if > 8 days)
 _DAY_PALETTE = [
@@ -69,73 +77,47 @@ def _collect_stats(all_days: list[dict]) -> list[dict]:
                 p90_cycle_min = float(t.quantile(0.9))
 
         # ── average pick time (seconds) overall + per station ────────────────
-        _SWITCH_S = 6.0
+        # Uses the shared arrived→triggerGo pairing (with the station-match
+        # guard) from dwell_time so all modules count picks identically.
         avg_pick_s: float | None = None
         avg_pick_by_station:     dict[str, float] = {}
         avg_util_pct_by_station: dict[str, float] = {}
-        if lsr is not None:
-            point2ws  = day.get("cfg", {}).get("point2ws", {})
-            lsr_c     = lsr.copy()
-            lsr_c["ts"]       = pd.to_datetime(lsr_c["时间戳"], errors="coerce")
-            lsr_c["_station"] = lsr_c["位置编号"].map(point2ws) if point2ws else None
-            ev = lsr_c.sort_values(["机器人编号", "ts"])
-            picks_all: list[float] = []
-            picks_by_ws: dict[str, list[float]] = {}
-            picks_by_ws_hour: dict[tuple, list[float]] = {}
-            for _rb, sub in ev.groupby("机器人编号"):
-                arr = arr_ws = None
-                for ts, et, ws in sub[["ts", "事件类型", "_station"]].values:
-                    if et == "arrived":
-                        arr, arr_ws = ts, ws
-                    elif et == "triggerGo" and arr is not None:
-                        val = float((ts - arr).total_seconds())
-                        if 0 <= val < 3600:
-                            picks_all.append(val)
-                            if pd.notna(arr_ws):
-                                picks_by_ws.setdefault(str(arr_ws), []).append(val)
-                                picks_by_ws_hour.setdefault(
-                                    (str(arr_ws), ts.floor("h")), []
-                                ).append(val)
-                        arr = None
-            if picks_all:
-                avg_pick_s = float(np.mean(picks_all))
-            for ws, vals in picks_by_ws.items():
-                avg_pick_by_station[ws] = float(np.mean(vals))
-            # util % per station: mean across hours of (actual / implied * 100)
-            util_by_ws: dict[str, list[float]] = {}
-            for (ws, _hr), pick_list in picks_by_ws_hour.items():
-                avg_p   = float(np.mean(pick_list))
-                actual  = len(pick_list)              # triggerGo count = completions
-                implied = 3600.0 / (avg_p + _SWITCH_S)
-                util_by_ws.setdefault(ws, []).append(actual / implied * 100.0)
-            for ws, pcts in util_by_ws.items():
-                avg_util_pct_by_station[ws] = float(np.mean(pcts))
+        day_cfg  = day.get("cfg", {})
+        point2ws = day_cfg.get("point2ws", {})
+        if lsr is not None and point2ws:
+            picks = extract_picks(lsr, day_cfg)
+            if len(picks):
+                avg_pick_s = float(picks["pick_s"].mean())
+                avg_pick_by_station = {
+                    str(ws): float(v)
+                    for ws, v in picks.groupby("station")["pick_s"].mean().items()
+                }
+                # util % per station: mean across hours of (actual / implied × 100),
+                # with implied capacity using a flat switch-time assumption based
+                # on observational data in the field (station-level switch time
+                # isn't reliably measurable with current logging quality).
+                per_hr = (
+                    picks.groupby(["station", "hour_dt"])["pick_s"]
+                    .agg(["mean", "size"])
+                    .reset_index()
+                )
+                per_hr["implied"] = 3600.0 / (per_hr["mean"] + SWITCH_S_FALLBACK)
+                per_hr["util"]    = per_hr["size"] / per_hr["implied"] * 100.0
+                avg_util_pct_by_station = {
+                    str(ws): float(v)
+                    for ws, v in per_hr.groupby("station")["util"].mean().items()
+                }
 
-        # ── median switch time (seconds) ──────────────────────────────────────
+        # ── median operational switch time (seconds) ──────────────────────────
+        # Only gaps ≤ MAX_OPERATIONAL_SWITCH_S count — longer gaps are
+        # starvation or breaks and would inflate the metric.
         med_switch_s: float | None = None
-        if lsr is not None:
-            lsr_c   = lsr.copy()
-            lsr_c["ts"] = pd.to_datetime(lsr_c["时间戳"], errors="coerce")
-            pos_col = next((c for c in lsr_c.columns if "位置编号" in str(c)), None)
-            evt_col = next((c for c in lsr_c.columns if "事件类型" in str(c)), None)
-            if pos_col and evt_col:
-                ev2 = lsr_c[
-                    lsr_c[evt_col].isin(["release", "arrived"]) &
-                    lsr_c[pos_col].notna()
-                ].sort_values([pos_col, "ts"])
-                gaps: list[float] = []
-                for _loc, sub in ev2.groupby(pos_col):
-                    open_rel = None
-                    for ts, et in sub[["ts", evt_col]].values:
-                        if et == "release":
-                            open_rel = ts
-                        elif et == "arrived" and open_rel is not None:
-                            gap = (ts - open_rel).total_seconds()
-                            if 0 <= gap < 7200:
-                                gaps.append(gap)
-                            open_rel = None
-                if gaps:
-                    med_switch_s = float(np.median(gaps))
+        if lsr is not None and point2ws:
+            gaps = _release_arrived_gaps(lsr, point2ws)
+            if not gaps.empty:
+                op = gaps[gaps["gap_s"] <= MAX_OPERATIONAL_SWITCH_S]
+                if not op.empty:
+                    med_switch_s = float(op["gap_s"].median())
 
         rows.append({
             "label":                   label,
@@ -472,7 +454,10 @@ def _avg_util_pct_trend(stats: list[dict]) -> dict | None:
         "figure":      fig,
         "source":      "All days",
         "method":      (
-            "For each station-hour, implied throughput = 3 600 ÷ (avg pick time + 6 s switch). "
+            f"For each station-hour, implied throughput = 3 600 ÷ (avg pick time + "
+            f"{SWITCH_S_FALLBACK:.0f} s), where the switch time is a flat assumption based "
+            "on observational data in the field (station-level switch time isn't reliably "
+            "measurable with current logging quality). "
             "Utilisation % = actual completions ÷ implied × 100. "
             "The value shown per station per day is the mean of that ratio across all active hours. "
             "100 % means the station was producing exactly as fast as operator speed allows. "

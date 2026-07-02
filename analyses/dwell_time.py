@@ -3,12 +3,21 @@ analyses/dwell_time.py — operator pick time at workstations.
 
 Pick time = time a robot sits at a LABOR station while the operator works,
 measured from 'arrived' to 'triggerGo' events in the station-record sheet.
+A pick is only counted when the triggerGo fires at the same station the robot
+arrived at (mismatches indicate lost events and are dropped).
+
+Duration statistics (median / average) attribute each pick's *full* duration
+to its arrival hour — durations are never split into hour segments, because a
+median of partial segments is not a median of pick times.  Occupancy-style
+metrics (used by throughput.py via _clipped_occupancy) do split seconds at
+hour boundaries, which is correct for time-in-use sums.
 
 Charts produced
 ---------------
-1. Pick time per station per hour (heatmap) — always shows Average pick time;
-   toggles Pick Time (s) / Implied Throughput (tasks/hr, assuming 6 s switch
-   per cycle).
+1. dwell_heatmap            — pick time per station per hour; toggles
+                              Median / Average / Implied Throughput
+                              (3 600 ÷ (avg pick + measured per-station switch)).
+2. dwell_pick_distribution  — smoothed pick-time density per workstation.
 """
 from __future__ import annotations
 
@@ -16,7 +25,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from config import AUTO_TYPE_PALETTE, INK
+from config import AUTO_TYPE_PALETTE, INK, SWITCH_S_FALLBACK
 
 # Low value = good (fast picks)
 _HEAT_COLORSCALE = [
@@ -32,8 +41,54 @@ _THROUGHPUT_COLORSCALE = [
     [0.8, "#93c5fd"], [1.0, "#f0f4ff"],
 ]
 
-# Fixed overhead added to each robot cycle outside of the observed pick
-_SWITCH_S = 6.0   # robot switch / handoff time (seconds)
+
+def extract_picks(lsr: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """Pair arrived→triggerGo events per robot into pick records.
+
+    Returns a DataFrame with columns: station, hour_dt (arrival hour),
+    pick_s, arr_ts, tg_ts.  Pairs where the triggerGo fired at a different
+    station than the arrival (lost events in between) are dropped.
+    Shared by throughput.py and summary.py so all modules count identically.
+    """
+    d = lsr.copy()
+    d["ts"]      = pd.to_datetime(d["时间戳"], errors="coerce")
+    d["station"] = d["位置编号"].map(cfg["point2ws"])
+
+    # Only the delivery AMR does operator picks — filter out shuttles so their
+    # shorter dwell events don't lower the average and inflate the implied ceiling.
+    amr_type = cfg.get("amr_type")
+    if amr_type and "机器人类型" in d.columns:
+        d = d[d["机器人类型"] == amr_type]
+
+    ev   = d.dropna(subset=["ts"]).sort_values(["机器人编号", "ts"])
+    rows: list[dict] = []
+    for _rb, sub in ev.groupby("机器人编号"):
+        arr = arr_loc = None
+        for ts, et, loc in sub[["ts", "事件类型", "station"]].values:
+            if et == "arrived":
+                arr, arr_loc = ts, loc
+            elif et == "triggerGo" and arr is not None:
+                # Station-match guard: if the triggerGo carries a station and it
+                # differs from the arrival station, events were lost in between —
+                # the duration would be attributed to the wrong station.
+                if pd.notna(loc) and pd.notna(arr_loc) and loc != arr_loc:
+                    arr = None
+                    continue
+                rows.append({
+                    "robot":    str(_rb),
+                    "station":  arr_loc,
+                    "hour_dt":  arr.floor("h"),
+                    "pick_s":   (ts - arr).total_seconds(),
+                    "arr_ts":   arr,
+                    "tg_ts":    ts,
+                })
+                arr = None
+
+    if not rows:
+        return pd.DataFrame(columns=["robot", "station", "hour_dt", "pick_s", "arr_ts", "tg_ts"])
+
+    out = pd.DataFrame(rows).dropna(subset=["station"])
+    return out[(out["pick_s"] >= 0) & (out["pick_s"] < 3600)]
 
 
 def _prep_heatmap_arrays(
@@ -122,7 +177,7 @@ def _station_hour_heatmap_toggle(
     ))
 
     _PICK_TITLE = "Operator Pick Time at Workstations"
-    _TPH_TITLE  = f"Implied Station Throughput — Pick Time + {int(_SWITCH_S)}s switch"
+    _TPH_TITLE  = "Implied Station Throughput — Pick Time + Measured Switch"
 
     fig.update_layout(
         title=dict(text=_PICK_TITLE, x=0, pad=dict(l=12), font=dict(size=17, color=INK)),
@@ -159,14 +214,6 @@ def _station_hour_heatmap_toggle(
         hoverlabel=dict(bgcolor="white", bordercolor="#cccccc"),
     )
     return fig
-
-
-_OCC_COLORSCALE = [
-    [0.0,  "#ef4444"],   # 0 %  — red   (idle)
-    [0.42, "#fbbf24"],   # ~40 % — yellow
-    [0.85, "#16a34a"],   # ~85 % — green
-    [1.0,  "#15803d"],   # 100 % — dark green (fully occupied)
-]
 
 
 def _clipped_occupancy(events, start_col, end_col, ws_order, all_hours):
@@ -210,329 +257,6 @@ def _clipped_occupancy(events, start_col, end_col, ws_order, all_hours):
             h += hour_td
 
     return occ.clip(upper=3600.0)
-
-
-def _capacity_gap_heatmap(
-    util_pick:  pd.DataFrame,          # station × hour — pick occupancy %
-    util_full:  pd.DataFrame | None,   # station × hour — pick + switch occupancy %
-    cfg: dict,
-) -> go.Figure:
-    """
-    Two-trace toggle:
-      Trace 0 — Pick occupancy: fraction of hour spent picking  [default]
-      Trace 1 — Station occupancy: pick + robot switch time
-    Both guaranteed ≤ 100 % for single-robot stations.
-    """
-    ws_order    = cfg["ws_order"]
-    hour_labels = [h.strftime("%H:00") for h in util_pick.columns]
-
-    def _arr(df: pd.DataFrame) -> np.ndarray:
-        return df.reindex(ws_order).values.astype(float)
-
-    def _text(arr: np.ndarray) -> list:
-        return [
-            [f"{arr[i, j]:.0f}%" if not np.isnan(arr[i, j]) else ""
-             for j in range(arr.shape[1])]
-            for i in range(arr.shape[0])
-        ]
-
-    _colorbar = dict(
-        title="Occupancy",
-        thickness=14, len=0.8,
-        tickvals=[0, 25, 50, 75, 100],
-        ticktext=["0%", "25%", "50%", "75%", "100%"],
-    )
-
-    pick_arr  = _arr(util_pick)
-    pick_text = _text(pick_arr)
-
-    def _arr_stats(arr: np.ndarray) -> tuple[float, float]:
-        valid = arr[~np.isnan(arr)]
-        if valid.size == 0:
-            return 0.0, 0.0
-        return float(np.mean(valid)), float(np.median(valid))
-
-    mean_p, med_p = _arr_stats(pick_arr)
-
-    _PICK_TITLE = "Station Occupancy — Pick Time Only"
-    _FULL_TITLE = "Station Occupancy — Pick + Switch Time"
-
-    fig = go.Figure()
-
-    # ── Trace 0 : pick occupancy (default) ───────────────────────────────────
-    fig.add_trace(go.Heatmap(
-        z=pick_arr.tolist(),
-        text=pick_text,
-        x=hour_labels, y=ws_order,
-        colorscale=_OCC_COLORSCALE,
-        zmin=0, zmax=100.0,
-        texttemplate="%{text}", textfont=dict(size=8),
-        hovertemplate=(
-            "<b>%{y}</b><br>%{x}<br>"
-            "Pick occupancy: %{z:.0f}%<extra></extra>"
-        ),
-        colorbar=_colorbar,
-        visible=True,
-    ))
-
-    buttons = [
-        dict(
-            label="Pick Only",
-            method="update",
-            args=[{"visible": [True, False]}, {"title.text": _PICK_TITLE}],
-        ),
-    ]
-
-    # ── Trace 1 : full station occupancy (hidden, added only if data exists) ─
-    if util_full is not None:
-        full_arr  = _arr(util_full)
-        full_text = _text(full_arr)
-        mean_f, med_f = _arr_stats(full_arr)
-        fig.add_trace(go.Heatmap(
-            z=full_arr.tolist(),
-            text=full_text,
-            x=hour_labels, y=ws_order,
-            colorscale=_OCC_COLORSCALE,
-            zmin=0, zmax=100.0,
-            texttemplate="%{text}", textfont=dict(size=8),
-            hovertemplate=(
-                "<b>%{y}</b><br>%{x}<br>"
-                "Station occupancy: %{z:.0f}%<extra></extra>"
-            ),
-            colorbar=_colorbar,
-            visible=False,
-        ))
-        buttons.append(dict(
-            label="Pick + Switch",
-            method="update",
-            args=[{"visible": [False, True]}, {"title.text": _FULL_TITLE}],
-        ))
-
-    _stats_text = (
-        f"Pick only — Mean: <b>{mean_p:.0f}%</b>  ·  Median: <b>{med_p:.0f}%</b>"
-    )
-    if util_full is not None:
-        _stats_text += (
-            f"   |   Pick + switch — Mean: <b>{mean_f:.0f}%</b>  ·  Median: <b>{med_f:.0f}%</b>"
-        )
-
-    fig.update_layout(
-        title=dict(text=_PICK_TITLE, x=0, pad=dict(l=12), font=dict(size=17, color=INK)),
-        updatemenus=[dict(
-            type="buttons", direction="right",
-            x=1.0, y=1.10, xanchor="right", yanchor="bottom",
-            showactive=True,
-            buttons=buttons,
-            bgcolor="white", bordercolor="#cccccc",
-            font=dict(color=INK, size=11),
-            pad=dict(r=4, t=4),
-        )],
-        yaxis=dict(autorange="reversed", tickfont=dict(size=10)),
-        xaxis=dict(tickangle=-45, tickfont=dict(size=9), title="Hour"),
-        plot_bgcolor="white", paper_bgcolor="white",
-        font=dict(color=INK, family="Inter, sans-serif"),
-        margin=dict(t=110, b=130, l=110, r=80),
-        hoverlabel=dict(bgcolor="white", bordercolor="#cccccc"),
-        annotations=[dict(
-            xref="paper", yref="paper", x=0, y=-0.20,
-            text=(
-                "Occupancy = seconds the station was in use ÷ 3 600.  "
-                "Events spanning hour boundaries are split proportionally.  "
-                "Guaranteed ≤ 100 % — one robot at a time per station.<br>"
-                + _stats_text
-            ),
-            font=dict(size=9, color="#666666"), showarrow=False, align="left",
-        )],
-    )
-    return fig
-
-
-def _pick_vs_throughput_scatter(
-    pivot_avg_s: pd.DataFrame,   # station × hour — avg pick time (s)
-    actual_t: pd.DataFrame,      # station × hour — actual completions/hr
-    cfg: dict,
-) -> go.Figure:
-    """
-    Scatter of actual throughput (Y) vs avg pick time (X) for every
-    station × hour observation that has both values.  OLS regression line
-    and R² are computed on the pooled sample to quantify how much of
-    throughput variance is explained by pick time alone.
-    """
-    ws_order    = cfg["ws_order"]
-    type_map    = cfg.get("type_map", {})
-    type_colors = cfg.get("type_colors", {})
-
-    _zone_color: dict[str, str] = {}
-    _pal_idx = 0
-
-    def _color(ws: str) -> str:
-        nonlocal _pal_idx
-        zone = type_map.get(ws, "")
-        if zone in type_colors:
-            return type_colors[zone]
-        if zone not in _zone_color:
-            _zone_color[zone] = AUTO_TYPE_PALETTE[_pal_idx % len(AUTO_TYPE_PALETTE)]
-            _pal_idx += 1
-        return _zone_color[zone]
-
-    # Build long-form table: one row per (station, hour) with both values
-    records = []
-    for ws in ws_order:
-        if ws not in pivot_avg_s.index or ws not in actual_t.index:
-            continue
-        for col in pivot_avg_s.columns:
-            pick_s = pivot_avg_s.at[ws, col]
-            tph    = actual_t.at[ws, col] if col in actual_t.columns else float("nan")
-            if pd.notna(pick_s) and pd.notna(tph) and pick_s > 0 and tph > 0:
-                records.append({"station": ws, "pick_s": pick_s, "tph": tph})
-
-    if not records:
-        fig = go.Figure()
-        fig.update_layout(
-            title=dict(text="Pick Time vs Actual Throughput (no data)", x=0),
-        )
-        return fig
-
-    df = pd.DataFrame(records)
-
-    # ── Automatic outlier removal (Tukey IQR fencing, 1.5×) ──────────────────
-    # Applied independently on both axes: removes station-hours with abnormally
-    # long/short pick times (instrument noise, robot stalls) and abnormally
-    # high/low throughput (start-of-shift ramp, end-of-shift drain).
-    def _iqr_bounds(s: pd.Series, k: float = 1.5) -> tuple[float, float]:
-        q1, q3 = float(s.quantile(0.25)), float(s.quantile(0.75))
-        iqr = q3 - q1
-        return q1 - k * iqr, q3 + k * iqr
-
-    x_lo, x_hi = _iqr_bounds(df["pick_s"])
-    y_lo, y_hi = _iqr_bounds(df["tph"])
-    inlier_mask = df["pick_s"].between(x_lo, x_hi) & df["tph"].between(y_lo, y_hi)
-    df_fit = df[inlier_mask].reset_index(drop=True)
-    df_out = df[~inlier_mask].reset_index(drop=True)
-    if df_fit.shape[0] < 4:          # safety: if too aggressive, keep everything
-        df_fit, df_out = df.copy(), pd.DataFrame(columns=df.columns)
-    n_removed = len(df_out)
-
-    # OLS on inliers only
-    x_all  = df_fit["pick_s"].values
-    y_all  = df_fit["tph"].values
-    coeffs = np.polyfit(x_all, y_all, 1)
-    slope, intercept = coeffs
-    y_pred = np.polyval(coeffs, x_all)
-    ss_res = float(np.sum((y_all - y_pred) ** 2))
-    ss_tot = float(np.sum((y_all - y_all.mean()) ** 2))
-    r2     = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-
-    x_line = np.linspace(x_all.min(), x_all.max(), 200)
-    y_line = np.polyval(coeffs, x_line)
-
-    fig = go.Figure()
-
-    # ── Outlier points — grey, rendered first so inliers sit on top ──────────
-    if not df_out.empty:
-        fig.add_trace(go.Scatter(
-            x=df_out["pick_s"], y=df_out["tph"],
-            mode="markers",
-            name=f"Excluded — IQR outlier ({n_removed})",
-            marker=dict(size=6, color="#cccccc", opacity=0.5,
-                        line=dict(width=0.5, color="#999999")),
-            customdata=df_out["station"].values,
-            hovertemplate=(
-                "<b>%{customdata}</b><br>"
-                "Pick time: %{x:.0f} s<br>"
-                "Throughput: %{y:.0f} tasks/hr<br>"
-                "<i>excluded from OLS fit (IQR outlier)</i><extra></extra>"
-            ),
-        ))
-
-    # ── Per-station scatter traces (inliers only) ─────────────────────────────
-    for ws in ws_order:
-        sub = df_fit[df_fit["station"] == ws]
-        if sub.empty:
-            continue
-        fig.add_trace(go.Scatter(
-            x=sub["pick_s"], y=sub["tph"],
-            mode="markers",
-            name=ws,
-            marker=dict(size=7, color=_color(ws), opacity=0.75,
-                        line=dict(width=0.5, color="white")),
-            hovertemplate=(
-                f"<b>{ws}</b><br>"
-                "Pick time: %{x:.0f} s<br>"
-                "Throughput: %{y:.0f} tasks/hr<extra></extra>"
-            ),
-        ))
-
-    # ── OLS regression line ───────────────────────────────────────────────────
-    r2_label    = f"R² = {r2:.3f}" if not np.isnan(r2) else "R² = n/a"
-    slope_label = f"slope = {slope:+.2f} tasks/hr per s"
-    fig.add_trace(go.Scatter(
-        x=x_line, y=y_line,
-        mode="lines",
-        name=f"OLS fit  ({r2_label})",
-        line=dict(color="#111827", width=2, dash="dash"),
-        hovertemplate=(
-            "OLS fit<br>"
-            "Pick time: %{x:.0f} s<br>"
-            "Fitted throughput: %{y:.1f} tasks/hr<extra></extra>"
-        ),
-    ))
-
-    # ── Theoretical ceiling: 3600 / (pick_s + _SWITCH_S) ────────────────────
-    x_ceil = np.linspace(max(1, x_all.min()), x_all.max(), 200)
-    y_ceil = 3600.0 / (x_ceil + _SWITCH_S)
-    fig.add_trace(go.Scatter(
-        x=x_ceil, y=y_ceil,
-        mode="lines",
-        name=f"Theoretical ceiling  (pick + {int(_SWITCH_S)}s switch)",
-        line=dict(color="#ef4444", width=1.5, dash="dot"),
-        hovertemplate=(
-            "Ceiling (operator-limited)<br>"
-            "Pick time: %{x:.0f} s<br>"
-            "Max throughput: %{y:.1f} tasks/hr<extra></extra>"
-        ),
-    ))
-
-    n_fit = len(df_fit)
-    outlier_note = (
-        f"  {n_removed} of {len(df)} points excluded as IQR outliers "
-        f"(Tukey 1.5× fence on pick time and throughput independently) — shown in grey."
-    ) if n_removed else ""
-    note = (
-        f"<b>{r2_label}</b> — pick time explains {r2*100:.0f}% of throughput variance "
-        f"across {n_fit} station-hour observations (fit on inliers only).{outlier_note}<br>"
-        f"{slope_label}.  "
-        f"Red dotted line = operator-speed ceiling (3 600 ÷ (pick + {int(_SWITCH_S)}s)).  "
-        "Points below the ceiling indicate robot-supply or non-pick losses."
-    ) if not np.isnan(r2) else (
-        f"Regression could not be computed ({n_fit} observations)."
-    )
-
-    fig.update_layout(
-        title=dict(
-            text="Pick Time vs Actual Throughput — OLS Fit",
-            x=0, pad=dict(l=12), font=dict(size=17, color=INK),
-        ),
-        xaxis=dict(
-            title="Avg pick time per station-hour (s)",
-            tickfont=dict(size=10), showgrid=True, gridcolor="#f0f0f0",
-        ),
-        yaxis=dict(
-            title="Actual completions / hr",
-            tickfont=dict(size=10), showgrid=True, gridcolor="#f0f0f0",
-        ),
-        legend=dict(orientation="v", x=1.02, y=1, font=dict(size=10)),
-        plot_bgcolor="white", paper_bgcolor="white",
-        font=dict(color=INK, family="Inter, sans-serif"),
-        margin=dict(t=80, b=120, l=80, r=200),
-        hoverlabel=dict(bgcolor="white", bordercolor="#cccccc"),
-        annotations=[dict(
-            xref="paper", yref="paper", x=0, y=-0.18,
-            text=note,
-            font=dict(size=9, color="#666666"), showarrow=False, align="left",
-        )],
-    )
-    return fig
 
 
 def _pick_time_distribution(d: pd.DataFrame, cfg: dict) -> go.Figure:
@@ -664,73 +388,15 @@ def run(data: dict, cfg: dict) -> list[dict]:
     if lsr is None:
         return []
 
-    lsr = lsr.copy()
-    lsr["ts"]      = pd.to_datetime(lsr["时间戳"])
-    lsr["station"] = lsr["位置编号"].map(cfg["point2ws"])
-
-    # Only K50 delivery robots do operator picks — filter out shuttles so their
-    # shorter dwell events don't lower the average and inflate the implied ceiling.
-    amr_type = cfg.get("amr_type")
-    if amr_type and "机器人类型" in lsr.columns:
-        lsr = lsr[lsr["机器人类型"] == amr_type]
-
-    ev   = lsr.sort_values(["机器人编号", "ts"])
-    rows = []
-    for _rb, sub in ev.groupby("机器人编号"):
-        arr = arr_loc = None
-        for ts, et, loc in sub[["ts", "事件类型", "station"]].values:
-            if et == "arrived":
-                arr, arr_loc = ts, loc
-            elif et == "triggerGo" and arr is not None:
-                rows.append({
-                    "station":  arr_loc,
-                    "hour_dt":  arr.floor("h"),
-                    "pick_s":   (ts - arr).total_seconds(),
-                    "arr_ts":   arr,
-                    "tg_ts":    ts,
-                })
-                arr = None
-
-    if not rows:
+    d = extract_picks(lsr, cfg)
+    if d.empty:
         return []
 
-    d = pd.DataFrame(rows).dropna(subset=["station"])
-    d = d[(d["pick_s"] >= 0) & (d["pick_s"] < 3600)]
-
-    # ── Time-slice expansion for heatmap pivots ──────────────────────────────
-    # Split each pick's seconds proportionally across clock-hour boundaries
-    # so that the heatmap aligns with the throughput chart's rigid hour buckets.
-    # A 20 s pick spanning 04:59:50 → 05:00:10 credits 10 s to 04:00, 10 s to 05:00.
-    _hour_td = pd.Timedelta(hours=1)
-    d["_arr_hour"]  = d["arr_ts"].dt.floor("h")
-    d["_secs_left"] = (d["_arr_hour"] + _hour_td - d["arr_ts"]).dt.total_seconds()
-
-    # Fast path — picks that fit entirely within their start hour (vast majority)
-    within = d[d["pick_s"] <= d["_secs_left"]]
-    sliced_rows: list[dict] = [
-        {"station": ws, "hour_dt": h, "pick_s": ps}
-        for ws, h, ps in zip(within["station"], within["_arr_hour"], within["pick_s"])
-    ]
-
-    # Slow path — picks that span an hour boundary (typically < 1 %)
-    for _, r in d[d["pick_s"] > d["_secs_left"]].iterrows():
-        s, e = r["arr_ts"], r["tg_ts"]
-        h = r["_arr_hour"]
-        while h < e:
-            seg_s = (min(e, h + _hour_td) - max(s, h)).total_seconds()
-            if seg_s > 0:
-                sliced_rows.append({
-                    "station": r["station"],
-                    "hour_dt": h,
-                    "pick_s":  seg_s,
-                })
-            h += _hour_td
-
-    d.drop(columns=["_arr_hour", "_secs_left"], inplace=True)
-    ds = pd.DataFrame(sliced_rows)
-    grp         = ds.groupby(["station", "hour_dt"])["pick_s"]
+    # ── Duration statistics: full pick durations, attributed to arrival hour ──
+    # (Never sliced into hour segments — a median of partial segments would
+    # understate and double-count boundary-spanning picks.)
+    grp         = d.groupby(["station", "hour_dt"])["pick_s"]
     pivot_med_s = grp.median().unstack()
-    pivot_avg_s = grp.mean().unstack()
 
     # Reindex columns to full 24-hour range so x-axis always shows 00–23
     all_hours: pd.DatetimeIndex | None = None
@@ -738,67 +404,91 @@ def run(data: dict, cfg: dict) -> list[dict]:
         day       = pivot_med_s.columns.min().normalize()
         all_hours = pd.date_range(day, periods=24, freq="h")
         pivot_med_s = pivot_med_s.reindex(columns=all_hours)
-        pivot_avg_s = pivot_avg_s.reindex(columns=all_hours)
 
     # ── Weighted avg pick time for implied throughput ──────────────────────────
     # Each task contributes its full duration, weighted by the fraction of the
     # task attributed to that hour (matching the proportional task-count logic
     # in throughput.py).  This ensures implied_capacity × fraction ≈ eff_tasks.
-    _hour_td2 = pd.Timedelta(hours=1)
-    _w_rows: list[dict] = []
-    for _, r in d.iterrows():
-        arr_hr = r["arr_ts"].floor("h")
-        tg_hr  = r["tg_ts"].floor("h")
-        dur    = r["pick_s"]
-        if dur <= 0:
-            continue
-        if arr_hr == tg_hr:
-            _w_rows.append({"station": r["station"], "hour_dt": arr_hr,
-                            "full_dur": dur, "frac": 1.0})
-        else:
+    # Vast majority of picks land entirely within one hour — handle those with a
+    # vectorised assignment, and only loop row-by-row for the rare boundary-spanning
+    # picks (which may cross more than one hour boundary for very long picks).
+    _hour_td2  = pd.Timedelta(hours=1)
+    _arr_hr    = d["arr_ts"].dt.floor("h")
+    _tg_hr     = d["tg_ts"].dt.floor("h")
+    _pos_mask  = d["pick_s"] > 0
+    _same_mask = _pos_mask & (_arr_hr == _tg_hr)
+    _cross_mask = _pos_mask & ~_same_mask
+
+    _w_frames: list[pd.DataFrame] = []
+    if _same_mask.any():
+        _w_frames.append(pd.DataFrame({
+            "station":  d.loc[_same_mask, "station"].values,
+            "hour_dt":  _arr_hr[_same_mask].values,
+            "full_dur": d.loc[_same_mask, "pick_s"].values,
+            "frac":     1.0,
+        }))
+
+    if _cross_mask.any():
+        _cross_rows: list[dict] = []
+        for r in d.loc[_cross_mask, ["station", "arr_ts", "tg_ts", "pick_s"]].itertuples(index=False):
+            arr_hr = r.arr_ts.floor("h")
+            tg_hr  = r.tg_ts.floor("h")
             h = arr_hr
             while h <= tg_hr:
-                seg = (min(r["tg_ts"], h + _hour_td2) - max(r["arr_ts"], h)).total_seconds()
+                seg = (min(r.tg_ts, h + _hour_td2) - max(r.arr_ts, h)).total_seconds()
                 if seg > 0:
-                    _w_rows.append({"station": r["station"], "hour_dt": h,
-                                    "full_dur": dur, "frac": seg / dur})
+                    _cross_rows.append({"station": r.station, "hour_dt": h,
+                                        "full_dur": r.pick_s, "frac": seg / r.pick_s})
                 h += _hour_td2
-    if _w_rows:
-        _wdf = pd.DataFrame(_w_rows)
+        if _cross_rows:
+            _w_frames.append(pd.DataFrame(_cross_rows))
+
+    if _w_frames:
+        _wdf = pd.concat(_w_frames, ignore_index=True)
         _wdf["w_dur"] = _wdf["frac"] * _wdf["full_dur"]
         _wg = _wdf.groupby(["station", "hour_dt"])
         pivot_wavg_s = (_wg["w_dur"].sum() / _wg["frac"].sum()).unstack()
         if all_hours is not None:
             pivot_wavg_s = pivot_wavg_s.reindex(columns=all_hours)
     else:
-        pivot_wavg_s = pivot_avg_s
+        pivot_wavg_s = grp.mean().unstack()
+        if all_hours is not None:
+            pivot_wavg_s = pivot_wavg_s.reindex(columns=all_hours)
 
-    # Implied throughput = 3600 / (weighted avg pick + switch)
-    pivot_avg_tph = 3600.0 / (pivot_wavg_s + _SWITCH_S)
+    # ── Implied throughput = 3600 / (weighted avg pick + flat switch assumption) ──
+    # Station-level switch time isn't reliably measurable with current logging
+    # quality, so implied throughput uses a flat field-observed assumption
+    # (see switch_time.py's switch_heatmap chart for measured switch time).
+    pivot_avg_tph = 3600.0 / (pivot_wavg_s + SWITCH_S_FALLBACK)
 
     fig = _station_hour_heatmap_toggle(pivot_med_s, pivot_wavg_s, pivot_avg_tph, cfg)
 
-    # ── Raw data shared by the first two charts ──────────────────────────────
-    # Per-station-hour summary (aggregated from time-sliced data)
+    # ── Raw data shared by the two charts ─────────────────────────────────────
+    # Per-station-hour summary (full pick durations, arrival-hour attribution)
     _dwell_summary_rows = []
-    for (_ws, _hr), _sub in ds.groupby(["station", "hour_dt"])["pick_s"]:
+    for (_ws, _hr), _sub in d.groupby(["station", "hour_dt"])["pick_s"]:
+        _mean = float(_sub.mean())
         _dwell_summary_rows.append({
             "station":   _ws,
             "hour":      _hr.strftime("%H:%M") if hasattr(_hr, "strftime") else str(_hr),
             "median_s":  round(float(_sub.median()), 2),
-            "mean_s":    round(float(_sub.mean()), 2),
+            "mean_s":    round(_mean, 2),
             "count":     int(len(_sub)),
-            "implied_tph_avg": round(3600.0 / (float(_sub.mean()) + _SWITCH_S), 2) if float(_sub.mean()) > 0 else None,
+            "switch_s_used": SWITCH_S_FALLBACK,
+            "implied_tph_avg": round(3600.0 / (_mean + SWITCH_S_FALLBACK), 2) if _mean > 0 else None,
         })
     # Individual pick events (full resolution — original durations for distribution)
-    _dwell_all_rows = [
-        {
-            "station": str(r["station"]),
-            "hour":    r["hour_dt"].strftime("%H:%M") if hasattr(r["hour_dt"], "strftime") else str(r["hour_dt"]),
-            "pick_s":  round(float(r["pick_s"]), 2),
-        }
-        for _, r in d[["station", "hour_dt", "pick_s"]].iterrows()
-    ]
+    _dwell_all_rows = pd.DataFrame({
+        "station": d["station"].astype(str),
+        "hour":    d["hour_dt"].dt.strftime("%H:%M"),
+        "pick_s":  d["pick_s"].astype(float).round(2),
+    }).to_dict("records")
+
+    _sw_note = (
+        f"a flat {SWITCH_S_FALLBACK:.0f} s assumption based on observational data in the "
+        "field (station-level switch time isn't reliably measurable with current logging "
+        "quality — see the Robot Switch Time chart for measured median/average switch time)"
+    )
 
     charts = [{
         "id":          "dwell_heatmap",
@@ -807,12 +497,14 @@ def run(data: dict, cfg: dict) -> list[dict]:
         "source":      "Station record sheet (labor_station_record)",
         "method":      (
             "Time a robot waits at the station while the operator works, measured from "
-            "each robot's 'arrived' event to its next 'triggerGo'. "
-            "Pick time seconds are time-sliced at clock-hour boundaries — a pick spanning "
-            "two hours is split proportionally so each hour only receives the seconds that "
-            "physically occurred within it (aligned with throughput counting). "
+            "each robot's 'arrived' event to its next 'triggerGo' at the same station "
+            "(pairs whose triggerGo fired at a different station indicate lost events and "
+            "are dropped). Each pick's full duration is attributed to its arrival hour — "
+            "durations are not split across hour boundaries, so the median and average are "
+            "true pick-time statistics. "
             "Toggle between Pick Time (Median), Pick Time (Average), and Implied Throughput "
-            f"(Average) — computed as tasks/hr = 3 600 ÷ (pick_s + {int(_SWITCH_S)}s switch). "
+            f"(Average) — computed as tasks/hr = 3 600 ÷ (avg pick + switch), where switch "
+            f"is the {_sw_note}. "
             "High pick time means the operator is the bottleneck — the robot is ready but "
             "waiting for the pick to complete. "
             "Stations with consistently high values may have harder tasks, heavier items, or "
@@ -822,6 +514,7 @@ def run(data: dict, cfg: dict) -> list[dict]:
         "export_hint": "robot_dwell_intervals.xlsx",
         "raw_data": {
             "description": "Pick time (arrived→triggerGo) per station per hour — median, mean, count, implied throughput",
+            "switch_time_source": _sw_note,
             "rows": _dwell_summary_rows,
         },
     }, {

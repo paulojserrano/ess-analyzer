@@ -32,6 +32,8 @@
 
 ## Stage Label Map (Chinese → English, from config.py)
   # ── Chinese column-prefix → English stage label ──────────────────────────────
+  # actual release→arrived gap cannot be measured from the station sheet.
+  # A release→arrived gap longer than this is treated as starvation / idle time
 
 ## Runtime cfg Dict Keys (built by data_loader.build_config)
   key                  type               description

@@ -227,9 +227,10 @@ def df_from_store(json_str: str) -> pd.DataFrame:
 
 def _read_sheets(xl: pd.ExcelFile) -> dict[str, pd.DataFrame | None]:
     data: dict[str, pd.DataFrame | None] = {
-        "callback":  None,
-        "station":   None,
-        "lifecycle": None,
+        "callback":   None,
+        "station":    None,
+        "lifecycle":  None,
+        "efficiency": None,
     }
 
     for name in xl.sheet_names:
@@ -250,14 +251,18 @@ def _read_sheets(xl: pd.ExcelFile) -> dict[str, pd.DataFrame | None]:
             elif TOTAL_DURATION_COL in cols or "K50完成耗时(秒)" in cols:
                 data["lifecycle"] = pd.read_excel(xl, sheet_name=name)
 
+            elif "效率瓶颈" in cols or "自然小时" in cols:
+                data["efficiency"] = pd.read_excel(xl, sheet_name=name)
+
         except Exception:
             continue
 
     # Fallback by known sheet names
     fallbacks = {
-        "callback":  ["回调明细"],
-        "station":   ["labor_station_record"],
-        "lifecycle": ["任务生命周期"],
+        "callback":   ["回调明细"],
+        "station":    ["labor_station_record"],
+        "lifecycle":  ["任务生命周期"],
+        "efficiency": ["HPS3效率对比"],
     }
     for key, candidates in fallbacks.items():
         if data[key] is None:
@@ -308,23 +313,25 @@ def load_data(path: str) -> dict[str, pd.DataFrame | None]:
         return convert_log_to_data([path])
 
     try:
-        xl = pd.ExcelFile(path, engine="openpyxl")
+        xl = pd.ExcelFile(path, engine="calamine")
     except Exception as exc:
         raise ValueError(
             f"Cannot open '{os.path.basename(path)}' as an Excel file: {exc}"
         ) from exc
 
-    if not xl.sheet_names:
-        raise ValueError(
-            f"'{os.path.basename(path)}' contains no sheets."
-        )
-
-    return _read_sheets(xl)
+    # Close the file handle when done — otherwise the xlsx stays locked on
+    # Windows until garbage collection.
+    with xl:
+        if not xl.sheet_names:
+            raise ValueError(
+                f"'{os.path.basename(path)}' contains no sheets."
+            )
+        return _read_sheets(xl)
 
 
 def load_data_from_bytes(content_bytes: bytes) -> dict[str, pd.DataFrame | None]:
     """Load an xlsx file from raw bytes (Dash upload callback)."""
-    xl = pd.ExcelFile(io.BytesIO(content_bytes), engine="openpyxl")
+    xl = pd.ExcelFile(io.BytesIO(content_bytes), engine="calamine")
     return _read_sheets(xl)
 
 

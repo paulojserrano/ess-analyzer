@@ -36,7 +36,12 @@
       "Bash(python -c \"import py_compile; py_compile.compile\\('analyses/throughput.py', doraise=True\\); print\\('OK'\\)\")",
       "Bash(python -c \"import py_compile; py_compile.compile\\('app.py', doraise=True\\); py_compile.compile\\('analyses/dwell_time.py', doraise=True\\); print\\('OK'\\)\")",
       "Bash(python3 -c ':*)",
-      "Bash(pyinstaller ESS_Analyzer.spec)"
+      "Bash(pyinstaller ESS_Analyzer.spec)",
+      "PowerShell(python \"C:\\\\Users\\\\PAULOS~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-PauloSerrano-OneDrive---hairobotics-Documents-Software-Development-Python-Scripts-ess-analyzer\\\\6b2e632d-4b54-411f-a08f-74bbed901e92\\\\scratchpad\\\\test_e2e.py\")",
+      "PowerShell(python ai_codex.py)",
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile analyses/throughput.py analyses/dwell_time.py analyses/summary.py)"
     ]
   }
 }

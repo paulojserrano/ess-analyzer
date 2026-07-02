@@ -18,7 +18,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from config import ACCENT, AUTO_TYPE_PALETTE, INK
+from config import ACCENT, AUTO_TYPE_PALETTE, INK, TOTAL_DURATION_COL
 
 
 # ── layout helper (mirrors other modules) ─────────────────────────────────────
@@ -79,27 +79,27 @@ def _queue_depth_leg_map(tlc: pd.DataFrame, cfg: dict) -> dict | None:
     df["d_start"] = df["complete_ts"] - pd.to_timedelta(df["leg_s"], unit="s")
     df = df.reset_index(drop=True)
 
-    # ── concurrent robots per station (vectorised O(n²), loop fallback) ───────
+    # ── robots concurrently in transit at the moment each delivery departed ──
+    # Instantaneous concurrency via a sorted-array sweep:
+    #   depth(t) = #(start_j ≤ t) − #(end_j < t)
+    # evaluated at each delivery's own start time (includes itself).
+    # Unlike any-overlap counting, the result does not grow with the
+    # delivery's own duration, so the depth→time correlation is a real
+    # queueing signal rather than an artefact of the metric.  O(n log n).
     depths = np.zeros(len(df), dtype=np.int32)
     for _stn, grp in df.groupby("station"):
         idx = grp.index.values
         s   = grp["d_start"].astype("int64").values
         e   = grp["complete_ts"].astype("int64").values
-        n   = len(idx)
-        if n == 0:
+        if len(idx) == 0:
             continue
-        if n <= 5_000:
-            overlap = (s[np.newaxis, :] <= e[:, np.newaxis]) & \
-                      (e[np.newaxis, :] >= s[:, np.newaxis])
-            np.fill_diagonal(overlap, False)
-            counts = overlap.sum(axis=1).astype(np.int32)
-        else:
-            counts = np.array([
-                int(np.sum((s <= e[i]) & (e >= s[i]))) - 1
-                for i in range(n)
-            ], dtype=np.int32)
-        for i, orig_i in enumerate(idx):
-            depths[orig_i] = counts[i] + 1  # +1 to include the robot itself
+        s_sorted = np.sort(s)
+        e_sorted = np.sort(e)
+        depth = (
+            np.searchsorted(s_sorted, s, side="right")
+            - np.searchsorted(e_sorted, s, side="left")
+        ).astype(np.int32)
+        depths[idx] = depth
 
     df["queue_depth"] = depths
 
@@ -158,8 +158,8 @@ def _queue_depth_leg_map(tlc: pd.DataFrame, cfg: dict) -> dict | None:
         rows=1, cols=2,
         column_widths=[0.48, 0.52],
         subplot_titles=[
-            f"~{med_lo}–{med_hi} robots assigned per outbound station (median)",
-            f"Delivery time grows as the pipeline fills (r={r:.2f})",
+            f"~{med_lo}–{med_hi} robots in transit per station at dispatch (median)",
+            f"Delivery time vs pipeline depth at dispatch (r={r:.2f}, n={len(df):,})",
         ],
         horizontal_spacing=0.12,
     )
@@ -206,7 +206,8 @@ def _queue_depth_leg_map(tlc: pd.DataFrame, cfg: dict) -> dict | None:
         x=0, y=-0.16,
         text=(
             f"{len(df):,} deliveries across {len(ordered_stations)} station(s).  "
-            f"Pearson r (concurrent robot count vs delivery time) = {r:.3f}."
+            f"Depth = robots concurrently in transit to the same station at the moment "
+            f"each delivery departed (sweep-line, instantaneous).  Pearson r = {r:.3f}."
         ),
         font=dict(size=10, color="#666"),
         showarrow=False,
@@ -215,9 +216,9 @@ def _queue_depth_leg_map(tlc: pd.DataFrame, cfg: dict) -> dict | None:
     fig.update_layout(
         title=dict(
             text=(
-                "Robots assigned per station vs delivery time<br>"
-                f"<sup>Each outbound station has ~{med_avg} robots working toward it at once.  "
-                "The deeper that pipeline, the slower each delivery.</sup>"
+                "Robots in transit per station vs delivery time<br>"
+                f"<sup>~{med_avg} robots are typically in transit to a station when a new "
+                "delivery departs.  The deeper that pipeline, the slower each delivery.</sup>"
             ),
             x=0, pad=dict(l=12),
             font=dict(size=17, color=INK),
@@ -232,7 +233,7 @@ def _queue_depth_leg_map(tlc: pd.DataFrame, cfg: dict) -> dict | None:
     fig.update_yaxes(row=1, col=1, title_text="Robots concurrently assigned to station",
                      showgrid=True, gridcolor="#eeeeee", rangemode="tozero")
     fig.update_xaxes(row=1, col=2,
-                     title_text="# robots assigned to station when this container was deposited",
+                     title_text="# robots already in transit to the station when this delivery departed",
                      tickfont=dict(size=10))
     fig.update_yaxes(row=1, col=2, title_text="Median delivery time (s)",
                      showgrid=True, gridcolor="#eeeeee", rangemode="tozero")
@@ -243,13 +244,14 @@ def _queue_depth_leg_map(tlc: pd.DataFrame, cfg: dict) -> dict | None:
         "figure":      fig,
         "source":      "Task lifecycle sheet",
         "method":      (
-            "Left: distribution of how many robots are simultaneously in transit to each "
-            "outbound station. A wide box with a high median means that station consistently "
+            "Left: distribution of how many robots were simultaneously in transit to each "
+            "outbound station, sampled at the moment each delivery departed (instantaneous "
+            "sweep-line count — not any-overlap counting, which would grow mechanically with "
+            "delivery duration). A wide box with a high median means that station consistently "
             "has a deep pipeline of robots queuing to deliver. "
-            "Right: median delivery time grouped by the number of concurrent robots assigned "
-            "to the same station. A rising step-curve confirms the queueing effect: each "
-            "additional robot in the pipeline lengthens every individual delivery because "
-            "robots must wait for the station to be free. "
+            "Right: median delivery time grouped by the pipeline depth the delivery entered. "
+            "A rising step-curve is genuine evidence of queueing: departing into a fuller "
+            "pipeline lengthens the delivery because robots wait for the station to be free. "
             "The Pearson r in the subtitle quantifies the strength of this relationship. "
             "The primary lever here is robot dispatch policy: smoothing the inflow rate "
             "per station reduces peak queue depth and shortens average delivery time."
@@ -258,14 +260,11 @@ def _queue_depth_leg_map(tlc: pd.DataFrame, cfg: dict) -> dict | None:
         "raw_data": {
             "description": "Per-delivery: destination station, delivery leg duration, concurrent robot count",
             "pearson_r_queue_vs_leg": round(float(r), 4),
-            "rows": [
-                {
-                    "station": str(row["station"]),
-                    "leg_s": round(float(row["leg_s"]), 2),
-                    "queue_depth": int(row["queue_depth"]),
-                }
-                for _, row in df[["station", "leg_s", "queue_depth"]].iterrows()
-            ],
+            "rows": pd.DataFrame({
+                "station":     df["station"].astype(str),
+                "leg_s":       df["leg_s"].astype(float).round(2),
+                "queue_depth": df["queue_depth"].astype(int),
+            }).to_dict("records"),
         },
     }
 
@@ -592,6 +591,143 @@ def _fleet_utilization_timeseries(lsr: pd.DataFrame, cfg: dict, tlc: pd.DataFram
     }
 
 
+# ── 3. Little's law consistency check ────────────────────────────────────────
+
+def _littles_law(tlc: pd.DataFrame, cfg: dict) -> dict | None:
+    """
+    Compare measured hourly work-in-progress (concurrent open tasks, sweep-line)
+    with the WIP predicted by Little's law, L = λ × W, where λ = completions/hr
+    and W = mean duration (hours) of tasks completed that hour.
+
+    Agreement validates that the logged task intervals are internally
+    consistent; divergence flags unmeasured queues or data-quality problems.
+    """
+    cmp_col = next((c for c in tlc.columns if "complete(" in str(c)), None)
+    if cmp_col is None or TOTAL_DURATION_COL not in tlc.columns:
+        return None
+
+    df = tlc.copy()
+    df["end"] = pd.to_datetime(df[cmp_col], errors="coerce")
+    df["dur_s"] = pd.to_numeric(df[TOTAL_DURATION_COL], errors="coerce")
+    df = df.dropna(subset=["end", "dur_s"])
+    df = df[(df["dur_s"] > 0) & (df["dur_s"] < 7200)]
+    if len(df) < 50:
+        return None
+
+    # Task interval: prefer the logged assignment time as start, fall back to
+    # complete − total duration (identical when the log is consistent).
+    assign_col = next((c for c in df.columns if "分配时间" in str(c)), None)
+    start_calc = df["end"] - pd.to_timedelta(df["dur_s"], unit="s")
+    if assign_col is not None:
+        assign_ts = pd.to_datetime(df[assign_col], errors="coerce")
+        df["start"] = assign_ts.fillna(start_calc)
+    else:
+        df["start"] = start_calc
+    df = df[df["start"] < df["end"]]
+    if df.empty:
+        return None
+
+    t0 = df["start"].min().floor("h")
+    t1 = df["end"].max().ceil("h")
+    minutes = pd.date_range(t0, t1, freq="min", inclusive="left")
+    if len(minutes) < 60:
+        return None
+
+    s_sorted = np.sort(df["start"].values.astype("int64"))
+    e_sorted = np.sort(df["end"].values.astype("int64"))
+    mins_i64 = minutes.values.astype("int64")
+    wip = (
+        np.searchsorted(s_sorted, mins_i64, side="right")
+        - np.searchsorted(e_sorted, mins_i64, side="left")
+    ).astype(float)
+
+    wip_hourly = (
+        pd.Series(wip, index=minutes)
+        .groupby(pd.Series(minutes, index=minutes).dt.floor("h"))
+        .mean()
+    )
+
+    # λ and W per completion hour
+    df["_hour"] = df["end"].dt.floor("h")
+    lam = df.groupby("_hour").size()                        # tasks/hr
+    w_h = df.groupby("_hour")["dur_s"].mean() / 3600.0      # hours
+    predicted = (lam * w_h).reindex(wip_hourly.index)
+
+    joined = pd.DataFrame({"measured": wip_hourly, "predicted": predicted}).dropna()
+    if len(joined) < 3:
+        return None
+
+    hl = [h.strftime("%H:00") for h in joined.index]
+    ratio = joined["predicted"] / joined["measured"].replace(0, np.nan)
+    med_ratio = float(ratio.median())
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=hl, y=joined["measured"].values,
+        marker_color="#cbd5e1", name="Measured avg WIP (open tasks)",
+        hovertemplate="<b>%{x}</b><br>Measured WIP: %{y:.1f} tasks<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=hl, y=joined["predicted"].values,
+        mode="lines+markers",
+        line=dict(color="#2563eb", width=2.5), marker=dict(size=6),
+        name="Little's law  λ × W",
+        hovertemplate="<b>%{x}</b><br>λ×W: %{y:.1f} tasks<extra></extra>",
+    ))
+    _base_layout(fig, "Work-in-Progress vs Little's Law (λ × W)")
+    fig.update_layout(
+        xaxis=dict(title="Hour", tickangle=-45),
+        yaxis=dict(title="Concurrent open tasks", showgrid=True,
+                   gridcolor="#eeeeee", rangemode="tozero"),
+        legend=dict(orientation="h", y=1.08, x=1, xanchor="right"),
+        margin=dict(t=80, b=100, l=70, r=40),
+        annotations=[dict(
+            xref="paper", yref="paper", x=0, y=-0.22,
+            text=(
+                f"Measured WIP = minute-resolution sweep-line count of open task intervals "
+                f"(assignment → complete), averaged per hour ({len(df):,} tasks).  "
+                f"λ = completions/hr;  W = mean duration of tasks completed that hour.  "
+                f"Median predicted ÷ measured = <b>{med_ratio:.2f}</b> "
+                f"(≈ 1.0 means the log is internally consistent; persistent deviation "
+                f"indicates unmeasured queue time or timestamp problems)."
+            ),
+            font=dict(size=9, color="#666"), showarrow=False, align="left",
+        )],
+    )
+    return {
+        "id":          "fleet_wip_littles_law",
+        "title":       "Work-in-Progress vs Little's Law",
+        "figure":      fig,
+        "source":      "Task lifecycle sheet",
+        "method":      (
+            "Consistency check based on Little's law (L = λ × W). Bars show the measured "
+            "average number of concurrently open tasks per hour (sweep-line over "
+            "assignment→complete intervals at one-minute resolution). The line shows the "
+            "WIP predicted from that hour's completion rate (λ) multiplied by the mean "
+            "duration of tasks completed in the hour (W). "
+            "When the two track each other, the logged intervals are internally consistent "
+            "and WIP can be trusted as a live load indicator. "
+            "Measured persistently above predicted means tasks linger open longer than "
+            "their recorded durations suggest (unmeasured queueing before assignment or "
+            "logging gaps). Divergence only at ramp-up/ramp-down hours is expected — "
+            "Little's law assumes a stable system."
+        ),
+        "export_hint": "",
+        "raw_data": {
+            "description": "Hourly measured average WIP vs Little's-law prediction",
+            "median_predicted_over_measured": round(med_ratio, 3),
+            "rows": [
+                {
+                    "hour": h,
+                    "measured_wip": round(float(joined["measured"].iloc[i]), 2),
+                    "predicted_wip": round(float(joined["predicted"].iloc[i]), 2),
+                }
+                for i, h in enumerate(hl)
+            ],
+        },
+    }
+
+
 # ── public entry point ────────────────────────────────────────────────────────
 
 def run(data: dict, cfg: dict) -> list[dict]:
@@ -606,6 +742,11 @@ def run(data: dict, cfg: dict) -> list[dict]:
 
     if lsr is not None:
         result = _fleet_utilization_timeseries(lsr.copy(), cfg, tlc=tlc.copy() if tlc is not None else None)
+        if result:
+            charts.append(result)
+
+    if tlc is not None:
+        result = _littles_law(tlc.copy(), cfg)
         if result:
             charts.append(result)
 

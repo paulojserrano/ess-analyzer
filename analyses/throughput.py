@@ -15,11 +15,15 @@ Charts produced
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from config import ACCENT, INK
+from config import ACCENT, INK, MAX_OPERATIONAL_SWITCH_S, SWITCH_S_FALLBACK
+
+_log = logging.getLogger(__name__)
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -95,31 +99,22 @@ def run(data: dict, cfg: dict) -> list[dict]:
     capacity_2d: np.ndarray | None = None
     if all_hours is not None:
         try:
-            from analyses.dwell_time import _clipped_occupancy
+            from analyses.dwell_time import _clipped_occupancy, extract_picks
 
-            pick_rows: list[dict] = []
-            for _rb, sub in lsr_t.sort_values(["机器人编号", "ts"]).groupby("机器人编号"):
-                arr = arr_loc = None
-                for ts_val, et, loc in sub[["ts", "事件类型", "station"]].values:
-                    if et == "arrived":
-                        arr, arr_loc = ts_val, loc
-                    elif et == "triggerGo" and arr is not None:
-                        pick_s = (ts_val - arr).total_seconds()
-                        if 0 < pick_s < 3600 and arr_loc in order:
-                            pick_rows.append({
-                                "station":  arr_loc,
-                                "arr_ts":   arr,
-                                "tg_ts":    ts_val,
-                            })
-                        arr = None
+            picks_all = extract_picks(lsr, cfg)
+            pick_d = picks_all[
+                (picks_all["pick_s"] > 0) & picks_all["station"].isin(order)
+            ].reset_index(drop=True)
 
-            if pick_rows:
-                pick_d = pd.DataFrame(pick_rows)
+            if not pick_d.empty:
                 pick_occ = _clipped_occupancy(
                     pick_d, "arr_ts", "tg_ts", order, all_hours,
                 )
 
-                # Switch time: release → next arrived, per station
+                # Switch time: release → next arrived, per station.  Only
+                # operational swaps (≤ MAX_OPERATIONAL_SWITCH_S) count as
+                # station occupancy — longer gaps are starvation or breaks,
+                # during which the station is emphatically NOT in use.
                 ev_sw = lsr_t[
                     lsr_t["事件类型"].isin(["release", "arrived"]) & lsr_t["station"].notna()
                 ].sort_values(["station", "ts"])
@@ -131,7 +126,7 @@ def run(data: dict, cfg: dict) -> list[dict]:
                             open_rel = ts_val
                         elif et == "arrived" and open_rel is not None:
                             sw_s = (ts_val - open_rel).total_seconds()
-                            if 0 <= sw_s < 7200:
+                            if 0 <= sw_s <= MAX_OPERATIONAL_SWITCH_S:
                                 sw_rows.append({
                                     "station":    ws,
                                     "rel_ts":     open_rel,
@@ -150,86 +145,78 @@ def run(data: dict, cfg: dict) -> list[dict]:
 
                 util_pct_2d = (full_occ / 3600.0 * 100.0).values
 
-                # ── Effective Tasks: actual completions with proportional hour attribution ──
+                # ── Effective Tasks & implied capacity: proportional hour attribution ──
                 # When a pick spans an hour boundary (arrived in hour A, triggerGo in hour B),
-                # credit is split proportionally by time spent in each hour.
-                pick_d["pick_s"] = (pick_d["tg_ts"] - pick_d["arr_ts"]).dt.total_seconds()
-                effective_tasks_2d = np.zeros_like(raw, dtype=float)
+                # credit is split proportionally by time spent in each hour. The vast
+                # majority of picks land entirely within one hour and are handled by a
+                # vectorised groupby; only boundary-spanning picks (rare) are split row by row.
                 ws_idx = {ws: i for i, ws in enumerate(order)}
                 hr_idx = {hr: j for j, hr in enumerate(all_hours)}
-                for _, row in pick_d.iterrows():
-                    si = ws_idx.get(row["station"])
-                    if si is None:
-                        continue
-                    arr_hr = row["arr_ts"].floor("h")
-                    tg_hr  = row["tg_ts"].floor("h")
-                    duration = row["pick_s"]
-                    if duration <= 0:
-                        continue
-                    if arr_hr == tg_hr:
-                        # Entire pick within one hour
-                        ji = hr_idx.get(arr_hr)
-                        if ji is not None:
-                            effective_tasks_2d[si, ji] += 1.0
-                    else:
-                        # Pick spans hour boundary — split proportionally
-                        boundary = tg_hr  # start of the completion hour
-                        secs_before = (boundary - row["arr_ts"]).total_seconds()
-                        frac_before = secs_before / duration
-                        frac_after  = 1.0 - frac_before
-                        ji_before = hr_idx.get(arr_hr)
-                        ji_after  = hr_idx.get(tg_hr)
-                        if ji_before is not None:
-                            effective_tasks_2d[si, ji_before] += frac_before
-                        if ji_after is not None:
-                            effective_tasks_2d[si, ji_after] += frac_after
-                # Mark inactive cells as NaN
-                effective_tasks_2d = np.where(raw == 0, np.nan, effective_tasks_2d)
 
-                # ── Implied capacity: weighted avg pick time using the same proportional fractions ──
-                # Each task contributes its full duration, weighted by the fraction of the
-                # task attributed to that hour. This keeps capacity consistent with
-                # effective_tasks so that a user can verify: eff_tasks / capacity = %.
+                effective_tasks_2d = np.zeros_like(raw, dtype=float)
                 weighted_sum = np.zeros_like(raw, dtype=float)  # sum(frac * duration)
                 weight_total = np.zeros_like(raw, dtype=float)  # sum(frac)
-                for _, row in pick_d.iterrows():
-                    si = ws_idx.get(row["station"])
-                    if si is None:
-                        continue
-                    arr_hr = row["arr_ts"].floor("h")
-                    tg_hr  = row["tg_ts"].floor("h")
-                    duration = row["pick_s"]
-                    if duration <= 0:
-                        continue
-                    if arr_hr == tg_hr:
-                        ji = hr_idx.get(arr_hr)
-                        if ji is not None:
-                            weighted_sum[si, ji] += duration
-                            weight_total[si, ji] += 1.0
-                    else:
-                        boundary = tg_hr
-                        secs_before = (boundary - row["arr_ts"]).total_seconds()
-                        frac_before = secs_before / duration
-                        frac_after  = 1.0 - frac_before
-                        ji_before = hr_idx.get(arr_hr)
-                        ji_after  = hr_idx.get(tg_hr)
-                        if ji_before is not None:
-                            weighted_sum[si, ji_before] += frac_before * duration
-                            weight_total[si, ji_before] += frac_before
-                        if ji_after is not None:
-                            weighted_sum[si, ji_after] += frac_after * duration
-                            weight_total[si, ji_after] += frac_after
-                avg_pick_2d = np.where(
-                    weight_total > 0, weighted_sum / weight_total, np.nan,
+
+                pd_hr = pick_d.assign(
+                    si=pick_d["station"].map(ws_idx),
+                    arr_hr=pick_d["arr_ts"].dt.floor("h"),
+                    tg_hr=pick_d["tg_ts"].dt.floor("h"),
                 )
+
+                same = pd_hr[pd_hr["arr_hr"] == pd_hr["tg_hr"]]
+                if not same.empty:
+                    g = same.groupby(["si", "arr_hr"])["pick_s"]
+                    for (si, hr), sub in g:
+                        ji = hr_idx.get(hr)
+                        if ji is None:
+                            continue
+                        cnt = len(sub)
+                        effective_tasks_2d[si, ji] += cnt
+                        weighted_sum[si, ji]        += sub.sum()
+                        weight_total[si, ji]        += cnt
+
+                cross = pd_hr[pd_hr["arr_hr"] != pd_hr["tg_hr"]]
+                for row in cross.itertuples():
+                    si = row.si
+                    duration = row.pick_s
+                    secs_before = (row.tg_hr - row.arr_ts).total_seconds()
+                    frac_before = secs_before / duration
+                    frac_after  = 1.0 - frac_before
+                    ji_before = hr_idx.get(row.arr_hr)
+                    ji_after  = hr_idx.get(row.tg_hr)
+                    if ji_before is not None:
+                        effective_tasks_2d[si, ji_before] += frac_before
+                        weighted_sum[si, ji_before]        += frac_before * duration
+                        weight_total[si, ji_before]        += frac_before
+                    if ji_after is not None:
+                        effective_tasks_2d[si, ji_after] += frac_after
+                        weighted_sum[si, ji_after]        += frac_after * duration
+                        weight_total[si, ji_after]        += frac_after
+
+                # Mark truly inactive cells as NaN.  Cells with raw == 0 but a
+                # fractional credit (a pick that spanned into this hour) keep
+                # their fraction so the day total is preserved.
+                effective_tasks_2d = np.where(
+                    (raw == 0) & (effective_tasks_2d == 0), np.nan, effective_tasks_2d,
+                )
+
+                avg_pick_2d = np.divide(
+                    weighted_sum, weight_total,
+                    out=np.full_like(weighted_sum, np.nan),
+                    where=weight_total > 0,
+                )
+                # Implied capacity uses a flat switch-time assumption (station-level
+                # switch measurement is unreliable with current logging quality).
                 capacity_2d = np.where(
                     ~np.isnan(avg_pick_2d),
-                    3600.0 / (avg_pick_2d + 6.0),
+                    3600.0 / (avg_pick_2d + SWITCH_S_FALLBACK),
                     np.nan,
                 )
-                capacity_2d = np.where(raw == 0, np.nan, capacity_2d)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.warning(
+                "throughput: effective-tasks/occupancy computation failed; "
+                "falling back to raw counts (%s: %s)", type(exc).__name__, exc,
+            )
 
     nonzero_totals = totals[totals > 0]
     avg_tp  = float(nonzero_totals.mean()) if len(nonzero_totals) else 0.0
@@ -552,7 +539,10 @@ def run(data: dict, cfg: dict) -> list[dict]:
                 "by time spent in each hour (5/8 to 10:00, 3/8 to 11:00). "
                 "The % of Implied Throughput toggle (top-right) shows Effective Tasks as a "
                 "percentage of Implied Capacity, where Implied Capacity = 3 600 ÷ (mean pick "
-                "time + 6 s) per station-hour, capped at 100 %. "
+                f"time + {SWITCH_S_FALLBACK:.0f} s) per station-hour, capped at 100 %. The "
+                f"{SWITCH_S_FALLBACK:.0f} s switch time is a flat assumption based on "
+                "observational data in the field, not a per-station measurement — current "
+                "event logging isn't reliable enough to measure switch time station by station. "
                 "Dark cells are high-throughput station-hours; pale cells are low-activity periods."
             )
             if use_effective else
@@ -564,9 +554,11 @@ def run(data: dict, cfg: dict) -> list[dict]:
                 "Rows that are consistently pale while others are dark indicate an uneven load "
                 "distribution that may warrant rebalancing."
                 + (
-                    "  Toggle '% of Implied Throughput' (top-right) to view (pick + switch "
-                    "time) ÷ 3 600 per station-hour — the fraction of the hour the station "
-                    "was actively in use."
+                    "  Toggle '% of Implied Throughput' (top-right) to view (pick + "
+                    "operational switch time) ÷ 3 600 per station-hour — the fraction of "
+                    "the hour the station was actively in use. Starvation gaps longer than "
+                    f"{MAX_OPERATIONAL_SWITCH_S/60:.0f} min (breaks, supply outages) do not "
+                    "count as active time."
                     if util_pct_2d is not None else ""
                 )
             )

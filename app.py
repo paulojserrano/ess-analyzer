@@ -33,7 +33,20 @@ from data_loader import (
     validate_file_path,
 )
 from config import ANALYSIS_MODULES, AUTO_TYPE_PALETTE, DEFAULT_CHECKED
-from analyses import throughput, dwell_time, switch_time, retrieval, fleet_utilization, summary as summary_mod
+from analyses import (
+    backlog,
+    data_quality,
+    dwell_time,
+    efficiency,
+    fleet_utilization,
+    retrieval,
+    return_flow,
+    robot_performance,
+    station_readiness,
+    summary as summary_mod,
+    switch_time,
+    throughput,
+)
 # from analyses import cycle_time  # temporarily disabled
 from report_builder import generate_html_report
 
@@ -43,10 +56,20 @@ _PIPELINE = [
     ("throughput", throughput),
     ("dwell",      dwell_time),
     ("switch",     switch_time),
+    ("readiness",  station_readiness),
     # ("cycle",      cycle_time),  # temporarily disabled
+    ("backlog",    backlog),
     ("retrieval",  retrieval),
     ("fleet",      fleet_utilization),
+    ("robot",      robot_performance),
+    ("returns",    return_flow),
+    ("efficiency", efficiency),
+    ("quality",    data_quality),
 ]
+
+# Steps that need the lifecycle sheet and are skipped without it.
+# (fleet / robot / quality also use it but degrade gracefully.)
+_LIFECYCLE_ONLY = {"cycle", "retrieval", "backlog"}
 
 # ── preferred chart display order in the HTML report ─────────────────────────
 # Charts listed here appear first, in this sequence.
@@ -959,18 +982,17 @@ class AnalyzerApp:
                 day_cfg["design_total_rate"] = user_cfg["design_total_rate"]
                 day_cfg["type_colors"]       = user_cfg["type_colors"]
 
-                # "cycle" and "retrieval" require the lifecycle sheet;
-                # "fleet" uses both sheets but degrades gracefully if either is absent
-                _lifecycle_only = {"cycle", "retrieval"}
+                # _LIFECYCLE_ONLY steps require the lifecycle sheet;
+                # other steps degrade gracefully if a sheet is absent
                 enabled_steps = [
                     (key, mod) for key, mod in _PIPELINE
                     if checks.get(key, False)
-                    and (key not in _lifecycle_only or data.get("lifecycle") is not None)
+                    and (key not in _LIFECYCLE_ONLY or data.get("lifecycle") is not None)
                 ]
                 skipped_steps = [
                     key for key, _ in _PIPELINE
                     if checks.get(key, False)
-                    and key in _lifecycle_only
+                    and key in _LIFECYCLE_ONLY
                     and data.get("lifecycle") is None
                 ]
                 n_steps = len(enabled_steps)
@@ -1836,7 +1858,7 @@ def _run_headless(path: str):
     registry: list[dict] = []
 
     for key, mod in _PIPELINE:
-        if key in ("cycle", "retrieval") and data.get("lifecycle") is None:
+        if key in _LIFECYCLE_ONLY and data.get("lifecycle") is None:
             print(f"  [skip] {key} — no lifecycle sheet")
             continue
         try:

@@ -6,6 +6,9 @@ Charts produced
 1. Retrievals per storage aisle (bar, hot aisles highlighted).
 2. Retrieval density heatmap — every storage bay (aisle × bay grid).
 3. Tote-level retrieval concentration — volume bar + Pareto curve.
+4. Retrievals + delivery leg time by storage level (vertical distribution).
+5. Median delivery leg per source aisle (distance proxy).
+6. Tote re-retrieval intervals (slotting / buffering opportunity).
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from config import ACCENT, INK
+from analyses.fleet_utilization import _delivery_leg_col
 
 _HEAT_COLORSCALE = [
     [0.0, "#f0f4ff"], [0.2, "#93c5fd"],
@@ -109,19 +113,23 @@ def _bay_heatmap(src: pd.DataFrame) -> dict:
         s2["bay_i"]   = pd.factorize(s2["Bay"])[0]
 
     aisles  = sorted(s2["aisle_i"].unique())
+    # Column range spans the observed bay IDs (0- or 1-based alike) so the
+    # factorised fallback path no longer drops bay 0.
+    min_bay = int(s2["bay_i"].min())
     max_bay = int(s2["bay_i"].max())
+    bays    = list(range(min_bay, max_bay + 1))
     grid = (
         s2.groupby(["aisle_i", "bay_i"])
         .size()
         .unstack(fill_value=0)
-        .reindex(index=aisles, columns=range(1, max_bay + 1), fill_value=0)
+        .reindex(index=aisles, columns=bays, fill_value=0)
     )
     gv   = grid.values.astype(float)
     vmax = float(np.percentile(gv[gv > 0], 97)) if (gv > 0).any() else 1.0
 
     fig = go.Figure(go.Heatmap(
         z=gv,
-        x=list(range(1, max_bay + 1)),
+        x=bays,
         y=[str(a) for a in aisles],
         colorscale=_HEAT_COLORSCALE,
         zmin=0, zmax=vmax,
@@ -264,6 +272,275 @@ def _tote_pareto(tlc: pd.DataFrame, bin_col: str) -> dict:
     }
 
 
+def _level_profile(src: pd.DataFrame, leg_col: str | None) -> dict | None:
+    """Retrievals per storage level, with median delivery leg when available —
+    the vertical dimension of the grid, which the aisle/bay charts ignore."""
+    s = src.copy()
+    try:
+        s["_lvl"] = s["Level"].astype(int)
+    except (ValueError, TypeError):
+        s["_lvl"] = s["Level"].astype(str)
+
+    counts = s.groupby("_lvl").size().sort_index()
+    if len(counts) < 2:
+        return None
+
+    lvl_labels = [str(l) for l in counts.index]
+
+    med_leg = None
+    if leg_col is not None and leg_col in s.columns:
+        legs = pd.to_numeric(s[leg_col], errors="coerce")
+        s["_leg"] = legs.where((legs > 0) & (legs < 3600))
+        by_lvl = s.groupby("_lvl")["_leg"]
+        med_leg = by_lvl.median().reindex(counts.index)
+        n_leg   = by_lvl.count().reindex(counts.index)
+        med_leg = med_leg.where(n_leg >= 10)  # suppress noisy levels
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=lvl_labels, y=counts.values,
+        marker_color="#2563eb", name="Retrievals",
+        hovertemplate="Level %{x}<br>Retrievals: %{y:,}<extra></extra>",
+    ))
+    if med_leg is not None and med_leg.notna().any():
+        fig.add_trace(go.Scatter(
+            x=lvl_labels, y=med_leg.round(1).values,
+            mode="lines+markers", yaxis="y2",
+            line=dict(color=ACCENT, width=2), marker=dict(size=6),
+            name="Median delivery leg (s)",
+            hovertemplate="Level %{x}<br>Median leg: %{y:.0f} s<extra></extra>",
+        ))
+    fig.update_layout(
+        title=dict(text="Retrieval Demand and Delivery Time by Storage Level",
+                   x=0, pad=dict(l=12), font=dict(size=17, color=INK)),
+        xaxis=dict(title="Storage level", type="category"),
+        yaxis=dict(title="Retrievals", showgrid=True, gridcolor="#eeeeee",
+                   rangemode="tozero"),
+        yaxis2=dict(title="Median delivery leg (s)", overlaying="y", side="right",
+                    showgrid=False, rangemode="tozero"),
+        legend=dict(orientation="h", y=1.08, x=1, xanchor="right", font=dict(size=10)),
+        plot_bgcolor="white", paper_bgcolor="white",
+        font=dict(color=INK, family="Inter, sans-serif"),
+        margin=dict(t=80, b=70, l=70, r=70),
+        hoverlabel=dict(bgcolor="white", bordercolor="#cccccc"),
+    )
+    return {
+        "id":          "retrieval_level_profile",
+        "title":       "Retrieval Demand and Delivery Time by Storage Level",
+        "figure":      fig,
+        "source":      "Task lifecycle sheet",
+        "method":      (
+            "Retrievals per storage level (bars) with the median delivery-leg duration per "
+            "level (line, right axis; suppressed below 10 samples). Level is the vertical "
+            "dimension the aisle/bay charts ignore: if high levels show materially longer "
+            "delivery legs, moving high-velocity totes to lower levels is a cheap win. "
+            "If demand concentrates on slow levels, the slotting strategy is actively "
+            "working against the fleet."
+        ),
+        "export_hint": "",
+        "raw_data": {
+            "description": "Retrievals and median delivery leg per storage level",
+            "rows": [
+                {
+                    "level": lvl_labels[i],
+                    "retrievals": int(counts.iloc[i]),
+                    "median_leg_s": (
+                        round(float(med_leg.iloc[i]), 1)
+                        if med_leg is not None and pd.notna(med_leg.iloc[i]) else None
+                    ),
+                }
+                for i in range(len(counts))
+            ],
+        },
+    }
+
+
+def _leg_by_aisle(src: pd.DataFrame, leg_col: str | None) -> dict | None:
+    """Median delivery-leg duration per source aisle — tests whether storage
+    distance actually drives delivery time (the actionable follow-up to the
+    bay heatmap's repositioning advice)."""
+    if leg_col is None or leg_col not in src.columns:
+        return None
+
+    s = src.copy()
+    legs = pd.to_numeric(s[leg_col], errors="coerce")
+    s["_leg"] = legs.where((legs > 0) & (legs < 3600))
+    s = s.dropna(subset=["_leg"])
+    if s.empty:
+        return None
+
+    g   = s.groupby("Aisle")["_leg"]
+    med = g.median()
+    q1  = g.quantile(0.25)
+    q3  = g.quantile(0.75)
+    n   = g.count()
+    keep = n >= 20
+    if keep.sum() < 3:
+        return None
+    med, q1, q3, n = med[keep], q1[keep], q3[keep], n[keep]
+    med = med.sort_index()
+    q1, q3, n = q1.reindex(med.index), q3.reindex(med.index), n.reindex(med.index)
+
+    overall = float(s["_leg"].median())
+    ax = med.index.astype(str).tolist()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=ax + ax[::-1],
+        y=q3.values.tolist() + q1.values[::-1].tolist(),
+        fill="toself", fillcolor="rgba(37,99,235,0.10)",
+        line=dict(width=0), hoverinfo="skip", showlegend=True,
+        name="Interquartile range",
+    ))
+    fig.add_trace(go.Scatter(
+        x=ax, y=med.values,
+        mode="lines+markers",
+        line=dict(color="#2563eb", width=2), marker=dict(size=6),
+        customdata=n.values,
+        name="Median delivery leg",
+        hovertemplate=(
+            "Aisle %{x}<br>Median leg: %{y:.0f} s<br>n = %{customdata}<extra></extra>"
+        ),
+    ))
+    fig.add_hline(
+        y=overall, line_dash="dash", line_color="#666666", line_width=1.5,
+        annotation_text=f"grid median {overall:.0f} s",
+        annotation_position="top right",
+        annotation_font=dict(size=10, color="#666666"),
+    )
+    fig.update_layout(
+        title=dict(text="Delivery Leg Duration by Source Aisle (distance proxy)",
+                   x=0, pad=dict(l=12), font=dict(size=17, color=INK)),
+        xaxis=dict(title="Source aisle", tickfont=dict(size=8)),
+        yaxis=dict(title="Delivery leg (s)", showgrid=True, gridcolor="#eeeeee",
+                   rangemode="tozero"),
+        legend=dict(orientation="h", y=1.08, x=1, xanchor="right", font=dict(size=10)),
+        plot_bgcolor="white", paper_bgcolor="white",
+        font=dict(color=INK, family="Inter, sans-serif"),
+        margin=dict(t=80, b=70, l=70, r=40),
+        hoverlabel=dict(bgcolor="white", bordercolor="#cccccc"),
+    )
+    return {
+        "id":          "retrieval_leg_by_aisle",
+        "title":       "Delivery Leg Duration by Source Aisle",
+        "figure":      fig,
+        "source":      "Task lifecycle sheet",
+        "method":      (
+            "Median delivery-leg duration per source aisle (line) with the interquartile "
+            "range (band); aisles with fewer than 20 deliveries are suppressed. "
+            "This tests the assumption behind the repositioning advice on the bay heatmap: "
+            "if the median rises with aisle number (or shows clear slow zones), storage "
+            "distance genuinely drives delivery time and moving hot totes closer will pay "
+            "off proportionally. If the line is flat, travel is not the dominant leg cost "
+            "and slotting changes will disappoint — look at station queueing instead. "
+            "A wide band on specific aisles indicates congestion variability rather than "
+            "distance (robots sometimes crawl through them)."
+        ),
+        "export_hint": "",
+        "raw_data": {
+            "description": "Median / IQR delivery leg per source aisle (n ≥ 20)",
+            "grid_median_leg_s": round(overall, 1),
+            "rows": [
+                {
+                    "aisle": ax[i],
+                    "median_leg_s": round(float(med.iloc[i]), 1),
+                    "q1_s": round(float(q1.iloc[i]), 1),
+                    "q3_s": round(float(q3.iloc[i]), 1),
+                    "n": int(n.iloc[i]),
+                }
+                for i in range(len(med))
+            ],
+        },
+    }
+
+
+def _tote_reretrieval(tlc: pd.DataFrame, bin_col: str) -> dict | None:
+    """Time between consecutive retrievals of the same tote — many short
+    intervals argue for a near-station buffer instead of full re-storage."""
+    cmp_col = next((c for c in tlc.columns if "complete(" in str(c)), None)
+    if cmp_col is None:
+        return None
+
+    df = tlc[[bin_col, cmp_col]].copy()
+    df.columns = ["tote", "ts"]
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna().sort_values(["tote", "ts"])
+
+    gaps_min = (
+        df.groupby("tote")["ts"].diff().dt.total_seconds().dropna() / 60.0
+    )
+    gaps_min = gaps_min[gaps_min > 0]
+    if len(gaps_min) < 30:
+        return None
+
+    CAP_MIN   = 480.0   # display cap: 8 h
+    THRESH_MIN = 30.0   # "rapid re-retrieval" threshold
+    within = float((gaps_min <= THRESH_MIN).mean() * 100)
+    med    = float(gaps_min.median())
+    clipped = gaps_min.clip(upper=CAP_MIN)
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=clipped, xbins=dict(start=0, end=CAP_MIN, size=10),
+        marker_color="#2563eb", opacity=0.85,
+        hovertemplate="Interval: %{x:.0f} min<br>Re-retrievals: %{y:,}<extra></extra>",
+        name="Re-retrievals",
+    ))
+    fig.add_vline(
+        x=THRESH_MIN, line_color=ACCENT, line_width=2, line_dash="dash",
+        annotation_text=f"{within:.0f}% within {THRESH_MIN:.0f} min",
+        annotation_position="top right",
+        annotation_font=dict(color=ACCENT, size=11),
+    )
+    fig.update_layout(
+        title=dict(text="Tote Re-Retrieval Intervals", x=0, pad=dict(l=12),
+                   font=dict(size=17, color=INK)),
+        xaxis=dict(title=f"Minutes between consecutive retrievals of the same tote (capped at {CAP_MIN:.0f})"),
+        yaxis=dict(title="Re-retrieval events", showgrid=True, gridcolor="#eeeeee"),
+        plot_bgcolor="white", paper_bgcolor="white",
+        font=dict(color=INK, family="Inter, sans-serif"),
+        margin=dict(t=70, b=90, l=70, r=40),
+        showlegend=False,
+        hoverlabel=dict(bgcolor="white", bordercolor="#cccccc"),
+        annotations=[dict(
+            xref="paper", yref="paper", x=0, y=-0.18,
+            text=(
+                f"{len(gaps_min):,} re-retrieval events · median interval "
+                f"<b>{med:.0f} min</b> · {(gaps_min > CAP_MIN).mean() * 100:.1f}% beyond "
+                f"the {CAP_MIN/60:.0f} h display cap"
+            ),
+            font=dict(size=10, color="#666"), showarrow=False,
+        )],
+    )
+    return {
+        "id":          "retrieval_tote_reinterval",
+        "title":       "Tote Re-Retrieval Intervals",
+        "figure":      fig,
+        "source":      "Task lifecycle sheet",
+        "method":      (
+            "For every tote retrieved more than once, the time between consecutive "
+            "retrievals (task completion timestamps). Each rapid re-retrieval means a tote "
+            "was carried back into storage only to be fetched again minutes later — two "
+            "full robot round-trips that a near-station buffer or delayed put-away would "
+            "have avoided. If a large share of re-retrievals falls inside the 30-minute "
+            "line, holding recently used totes near the outbound stations would directly "
+            "remove that share of storage round-trips. This is the complementary signal to "
+            "the Pareto chart: the Pareto says WHICH totes are hot, this says HOW SOON they "
+            "come back."
+        ),
+        "export_hint": "retrieval_demand_by_aisle.xlsx",
+        "raw_data": {
+            "description": "Intervals between consecutive retrievals of the same tote",
+            "n_reretrievals": int(len(gaps_min)),
+            "median_interval_min": round(med, 1),
+            "pct_within_30min": round(within, 1),
+            "rows": [
+                {"interval_min": round(float(v), 1)} for v in gaps_min.values
+            ],
+        },
+    }
+
+
 # ── public entry point ────────────────────────────────────────────────────────
 
 def run(data: dict, cfg: dict) -> list[dict]:
@@ -282,5 +559,14 @@ def run(data: dict, cfg: dict) -> list[dict]:
     ]
     if bin_col and bin_col in tlc.columns:
         charts.append(_tote_pareto(tlc, bin_col))
+
+    leg_col = _delivery_leg_col(tlc, cfg)
+    for maybe in (
+        _level_profile(src, leg_col),
+        _leg_by_aisle(src, leg_col),
+        _tote_reretrieval(tlc, bin_col) if bin_col and bin_col in tlc.columns else None,
+    ):
+        if maybe:
+            charts.append(maybe)
 
     return charts

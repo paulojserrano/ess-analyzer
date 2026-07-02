@@ -33,7 +33,7 @@ def _base_layout(fig: go.Figure, title: str) -> None:
 
 # ── sub-charts ────────────────────────────────────────────────────────────────
 
-def _histogram(tj: pd.DataFrame) -> dict:
+def _histogram(tj: pd.DataFrame, n_over_2h: int = 0) -> dict:
     t   = tj["cycle_min"]
     CAP = 30
     med, p90, p99 = t.median(), t.quantile(0.9), t.quantile(0.99)
@@ -69,8 +69,10 @@ def _histogram(tj: pd.DataFrame) -> dict:
         showlegend=False,
         annotations=[dict(
             xref="paper", yref="paper", x=0, y=-0.18,
-            text=(f"{len(t):,} tasks · capped at {CAP} min "
-                  f"({beyond:.1f}% run longer)"),
+            text=(f"{len(t):,} tasks · display capped at {CAP} min "
+                  f"({beyond:.1f}% run longer)"
+                  + (f" · {n_over_2h:,} task(s) over 2 h excluded from all statistics"
+                     if n_over_2h else "")),
             font=dict(size=10, color="#666"), showarrow=False,
         )],
     )
@@ -82,6 +84,9 @@ def _histogram(tj: pd.DataFrame) -> dict:
         "method":      (
             f"Distribution of total task durations, capped at {CAP} min for readability "
             f"(tasks beyond the cap are counted in the footer annotation). "
+            "Tasks longer than 2 h are excluded from every statistic on this page — "
+            "the footer reports how many were dropped so extreme outliers are never "
+            "silently hidden. "
             "A narrow, symmetric mound around the median is healthy. "
             "A long right tail — where p90 or p99 is much larger than the median — means a "
             "significant fraction of tasks experience severe delays worth investigating. "
@@ -97,6 +102,7 @@ def _histogram(tj: pd.DataFrame) -> dict:
                 "p90_min": round(float(p90), 3),
                 "p99_min": round(float(p99), 3),
                 "pct_beyond_cap": round(float((t > CAP).mean() * 100), 2),
+                "tasks_over_2h_excluded": int(n_over_2h),
             },
             "rows": [
                 {"hour": str(h), "cycle_min": round(float(c), 3)}
@@ -161,18 +167,51 @@ def _by_hour(tj: pd.DataFrame) -> dict:
     }
 
 
-def _demand_vs_cycle(tj: pd.DataFrame, cb: pd.DataFrame) -> dict | None:
-    cb = cb.copy()
-    cb["ts"]   = pd.to_datetime(cb["时间戳"])
-    cb["hour"] = cb["ts"].dt.floor("h")
-    comp   = cb[
-        (cb["动作类型"] == "complete") &
-        cb["位置类型"].astype(str).str.startswith("LABOR")
-    ]
-    demand = comp.groupby("hour").size()
+def _hourly_completions(
+    cb: pd.DataFrame | None,
+    lsr: pd.DataFrame | None,
+    cfg: dict,
+) -> tuple[pd.Series | None, str]:
+    """Hourly completed-task counts, preferring station-sheet triggerGo events
+    (the same completion definition used by the throughput module) and falling
+    back to callback 'complete' events at LABOR locations.
+
+    Returns (series indexed by hour, source label)."""
+    if lsr is not None and cfg.get("point2ws"):
+        s = lsr.copy()
+        s["ts"]      = pd.to_datetime(s["时间戳"], errors="coerce")
+        s["station"] = s["位置编号"].map(cfg["point2ws"])
+        tgo = s[(s["事件类型"] == "triggerGo") & s["station"].notna()].dropna(subset=["ts"])
+        if len(tgo):
+            return (
+                tgo.groupby(tgo["ts"].dt.floor("h")).size(),
+                "station sheet (triggerGo — same definition as the throughput charts)",
+            )
+
+    if cb is not None:
+        c = cb.copy()
+        c["ts"] = pd.to_datetime(c["时间戳"], errors="coerce")
+        comp = c[
+            (c["动作类型"] == "complete") &
+            c["位置类型"].astype(str).str.startswith("LABOR")
+        ].dropna(subset=["ts"])
+        if len(comp):
+            return (
+                comp.groupby(comp["ts"].dt.floor("h")).size(),
+                "callback sheet (complete events at LABOR — station sheet unavailable)",
+            )
+
+    return None, ""
+
+
+def _demand_vs_cycle(
+    tj: pd.DataFrame,
+    demand: pd.Series,
+    demand_src: str,
+) -> dict | None:
     med    = tj.groupby("hour")["cycle_min"].median()
     joined = pd.DataFrame({"demand": demand, "cycle": med}).dropna()
-    if joined.empty:
+    if len(joined) < 3:
         return None
 
     hl = [h.strftime("%H:00") for h in joined.index]
@@ -220,7 +259,8 @@ def _demand_vs_cycle(tj: pd.DataFrame, cb: pd.DataFrame) -> dict | None:
     fig.add_trace(go.Scatter(
         x=xs, y=np.poly1d(coef)(xs), mode="lines",
         line=dict(color=ACCENT, width=2, dash="dash"),
-        name=f"Linear trend  r={r:.2f}  ρ={r_spearman:.2f}", showlegend=True,
+        name=f"Linear trend  r={r:.2f}  ρ={r_spearman:.2f}  (n={len(xd)} hrs)",
+        showlegend=True,
     ), row=1, col=2)
 
     fig.update_layout(
@@ -244,21 +284,29 @@ def _demand_vs_cycle(tj: pd.DataFrame, cb: pd.DataFrame) -> dict | None:
         "id":          "demand_vs_cycle",
         "title":       "Throughput Demand vs Cycle Time",
         "figure":      fig,
-        "source":      "Task lifecycle sheet + callback detail sheet",
+        "source":      f"Task lifecycle sheet + {demand_src}",
         "method":      (
-            "Left: hourly throughput (bars) overlaid with median cycle time (line, right axis) — "
-            "shows whether the two move together. "
+            f"Left: hourly completions from the {demand_src} (bars) overlaid with median "
+            "cycle time (line, right axis) — shows whether the two move together. "
             "Right: each dot is one hour; the dashed line is a linear trend. "
             "A positive slope (r > 0, ρ > 0) means the system is demand-sensitive: "
-            "higher throughput causes longer cycles, the hallmark of a capacity-constrained queue. "
+            "higher throughput coincides with longer cycles, the hallmark of a "
+            "capacity-constrained queue. "
             "A flat or negative slope suggests cycle time is driven by other factors "
             "(storage distances, operator pace, robot availability) rather than demand volume. "
             "Pearson r measures linear correlation; Spearman ρ is more reliable when the "
-            "relationship is non-linear (common near capacity limits)."
+            "relationship is non-linear (common near capacity limits). "
+            f"Caution: with only n={len(joined)} hourly observations these correlations have "
+            "wide confidence intervals — treat them as directional, not definitive. Note also "
+            "that completions measure realised throughput, not offered demand; at saturation "
+            "the true demand-sensitivity is understated (see the allocation-wait chart for an "
+            "unconstrained demand signal)."
         ),
         "export_hint": "cycle_time_distribution.xlsx",
         "raw_data": {
-            "description": "Hourly throughput demand and median cycle time",
+            "description": "Hourly completions and median cycle time",
+            "demand_source": demand_src,
+            "n_hours": int(len(joined)),
             "pearson_r": round(float(r), 4),
             "spearman_rho": round(float(r_spearman), 4),
             "rows": [
@@ -278,30 +326,32 @@ def _stage_donut(tlc: pd.DataFrame, cfg: dict) -> dict | None:
     if not stages:
         return None
 
-    meds = []
+    # Mean durations — unlike medians, means are additive across stages, so
+    # the slice shares genuinely represent shares of total task time.
+    means = []
     for s in stages:
         dd = tlc[s].dropna()
         dd = dd[(dd >= 0) & (dd < 3600)]
-        meds.append(float(dd.median()) if len(dd) else 0.0)
+        means.append(float(dd.mean()) if len(dd) else 0.0)
 
-    total_med = float(
+    total_mean = float(
         tlc[TOTAL_DURATION_COL]
         .pipe(lambda s: s[(s >= 0) & (s < 7200)])
-        .median()
+        .mean()
     )
 
     fig = go.Figure(go.Pie(
         labels=stage_lbl,
-        values=meds,
+        values=means,
         hole=0.45,
         marker=dict(colors=stage_col, line=dict(color="white", width=2)),
         textinfo="label+percent",
-        hovertemplate="<b>%{label}</b><br>Median: %{value:.0f}s<br>Share: %{percent}<extra></extra>",
+        hovertemplate="<b>%{label}</b><br>Mean: %{value:.0f}s<br>Share: %{percent}<extra></extra>",
     ))
     fig.update_layout(
-        title=dict(text="Median Cycle Time Composition (All Tasks)", x=0, pad=dict(l=12), font=dict(size=17, color=INK)),
+        title=dict(text="Mean Cycle Time Composition (All Tasks)", x=0, pad=dict(l=12), font=dict(size=17, color=INK)),
         annotations=[dict(
-            text=f"<b>{int(total_med)}s</b><br>total median",
+            text=f"<b>{int(total_mean)}s</b><br>total mean",
             x=0.5, y=0.5, xref="paper", yref="paper",
             showarrow=False, font=dict(size=15, color=INK),
         )],
@@ -314,25 +364,26 @@ def _stage_donut(tlc: pd.DataFrame, cfg: dict) -> dict | None:
     )
     return {
         "id":          "cycle_stage_donut",
-        "title":       "Median Cycle Time Stage Composition",
+        "title":       "Mean Cycle Time Stage Composition",
         "figure":      fig,
         "source":      "Task lifecycle sheet",
         "method":      (
-            f"Median duration of each detected stage column "
+            f"Mean duration of each detected stage column "
             f"({', '.join(stage_lbl)}) across all completed tasks. "
-            "The centre shows the actual total-duration median. "
+            "Means are used (rather than medians) because means are additive — the slice "
+            "shares genuinely represent shares of total task time, and the slices "
+            "approximately sum to the total mean shown in the centre (small differences "
+            "remain where individual stage values are missing or filtered). "
             "The largest slice is where most task time is consumed and therefore the "
-            "highest-leverage stage to target for improvement. "
-            "Note: stage medians are computed independently and are not additive, "
-            "so their sum may differ from the total shown in the centre."
+            "highest-leverage stage to target for improvement."
         ),
         "export_hint": "cycle_time_distribution.xlsx",
         "raw_data": {
-            "description": "Median duration per lifecycle stage (all tasks combined)",
-            "total_median_s": round(float(total_med), 2),
+            "description": "Mean duration per lifecycle stage (all tasks combined)",
+            "total_mean_s": round(float(total_mean), 2),
             "stages": [
-                {"stage": lbl, "median_s": round(float(v), 2)}
-                for lbl, v in zip(stage_lbl, meds)
+                {"stage": lbl, "mean_s": round(float(v), 2)}
+                for lbl, v in zip(stage_lbl, means)
             ],
         },
     }
@@ -352,11 +403,13 @@ def _stage_by_station(tlc: pd.DataFrame, cfg: dict) -> dict | None:
     fig = go.Figure()
     bottoms = np.zeros(len(ws_order))
     for s, lbl, c in zip(stages, stage_lbl, stage_col):
+        # Means, not medians — means are additive, so the stacked total is a
+        # genuine estimate of total time per task at that station.
         vals = np.array([
             float(np.nan_to_num(
                 tj2[tj2["station"] == ws][s]
                 .pipe(lambda x: x[(x >= 0) & (x < 3600)])
-                .median(),
+                .mean(),
                 nan=0.0,
             ))
             for ws in ws_order
@@ -371,7 +424,7 @@ def _stage_by_station(tlc: pd.DataFrame, cfg: dict) -> dict | None:
     fig.update_layout(
         barmode="overlay",
         title=dict(text="Cycle Time Composition by Workstation", x=0, pad=dict(l=12), font=dict(size=17, color=INK)),
-        xaxis_title="Station", yaxis_title="Median time in stage (s)",
+        xaxis_title="Station", yaxis_title="Mean time in stage (s)",
         plot_bgcolor="white", paper_bgcolor="white",
         font=dict(color=INK, family="Inter, sans-serif"),
         margin=dict(t=70, b=70, l=70, r=160),
@@ -385,7 +438,7 @@ def _stage_by_station(tlc: pd.DataFrame, cfg: dict) -> dict | None:
         _row_s: dict = {"station": _ws}
         for _s, _lbl in zip(stages, stage_lbl):
             _sub_s = tj2[tj2["station"] == _ws][_s].pipe(lambda x: x[(x >= 0) & (x < 3600)])
-            _row_s[_lbl] = round(float(_sub_s.median()), 2) if len(_sub_s) else None
+            _row_s[_lbl] = round(float(_sub_s.mean()), 2) if len(_sub_s) else None
         _stage_rows.append(_row_s)
 
     return {
@@ -394,7 +447,9 @@ def _stage_by_station(tlc: pd.DataFrame, cfg: dict) -> dict | None:
         "figure":      fig,
         "source":      "Task lifecycle sheet",
         "method":      (
-            "Median time in each lifecycle stage, stacked per destination workstation. "
+            "Mean time in each lifecycle stage, stacked per destination workstation "
+            "(means are additive, so bar heights are a genuine estimate of total time "
+            "per task). "
             "Taller bars overall indicate stations with longer cycle times. "
             "Comparing the colour composition across stations reveals *why* they differ: "
             "a station with a disproportionately large delivery-leg segment may be "
@@ -416,6 +471,7 @@ def _stage_by_station(tlc: pd.DataFrame, cfg: dict) -> dict | None:
 def run(data: dict, cfg: dict) -> list[dict]:
     tlc = data.get("lifecycle")
     cb  = data.get("callback")
+    lsr = data.get("station")
     if tlc is None:
         return []
 
@@ -430,15 +486,17 @@ def run(data: dict, cfg: dict) -> list[dict]:
         )
 
     tj = tlc.dropna(subset=[TOTAL_DURATION_COL]).copy()
+    n_over_2h = int((tj[TOTAL_DURATION_COL] >= 7200).sum())
     tj = tj[(tj[TOTAL_DURATION_COL] >= 0) & (tj[TOTAL_DURATION_COL] < 7200)]
     tj["cycle_min"] = tj[TOTAL_DURATION_COL] / 60.0
 
     charts: list[dict] = []
-    charts.append(_histogram(tj))
+    charts.append(_histogram(tj, n_over_2h=n_over_2h))
     charts.append(_by_hour(tj))
 
-    if cb is not None:
-        result = _demand_vs_cycle(tj, cb)
+    demand, demand_src = _hourly_completions(cb, lsr, cfg)
+    if demand is not None:
+        result = _demand_vs_cycle(tj, demand, demand_src)
         if result:
             charts.append(result)
 
