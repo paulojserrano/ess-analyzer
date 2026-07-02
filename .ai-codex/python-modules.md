@@ -1,7 +1,7 @@
-# Python Modules Map (generated 2026-06-26)
+# Python Modules Map (generated 2026-07-01)
 # Root-level modules: classes, methods, top-level functions
 
-## app.py  (1844 lines)
+## app.py  (1867 lines)
    app.py — Tkinter GUI for the ESS / ASRS Log Analyser.
 
    class AnalyzerApp
@@ -87,7 +87,7 @@
      def _format_stage_label          (col: str)
      def _detect_amr_type             (lsr: pd.DataFrame)
 
-## report_builder.py  (1102 lines)
+## report_builder.py  (1100 lines)
    report_builder.py — Generate a self-contained HTML report with interactive
 
    Top-level functions:

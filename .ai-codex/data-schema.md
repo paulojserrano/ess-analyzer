@@ -1,4 +1,4 @@
-# Data Schema Reference (generated 2026-06-26)
+# Data Schema Reference (generated 2026-07-01)
 # Expected Excel sheets, column names, and runtime config keys
 
 ## Excel Sheets (auto-detected by signature columns)

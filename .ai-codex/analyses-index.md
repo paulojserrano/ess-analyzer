@@ -1,4 +1,4 @@
-# Analyses Index (generated 2026-06-26)
+# Analyses Index (generated 2026-07-01)
 # Each module exports run(data, cfg) -> list[ChartResult]
 # ChartResult keys: id, title, figure, source, method, export_hint
 
@@ -21,7 +21,7 @@
      def _stage_by_station          (tlc: pd.DataFrame, cfg: dict)
      def run                        (data: dict, cfg: dict)
 
-## dwell_time.py  (816 lines)
+## dwell_time.py  (849 lines)
    analyses/dwell_time.py — operator pick time at workstations.
 
    Charts:
@@ -97,7 +97,7 @@
      def _prep_arrays               (pivot: pd.DataFrame, ws_order: list, fmt: str)
      def run                        (data: dict, cfg: dict)
 
-## throughput.py  (703 lines)
+## throughput.py  (749 lines)
    analyses/throughput.py — completions per LABOR station per hour.
 
    Charts:

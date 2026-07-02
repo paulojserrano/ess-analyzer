@@ -69,8 +69,6 @@ _HEAD = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hai Robotics ESS Log Analyzer</title>
-<!-- Plotly.js (loaded once) -->
-<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   body  { font-family: 'Segoe UI', system-ui, Arial, sans-serif;

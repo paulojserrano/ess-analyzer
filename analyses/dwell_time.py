@@ -740,10 +740,43 @@ def run(data: dict, cfg: dict) -> list[dict]:
         pivot_med_s = pivot_med_s.reindex(columns=all_hours)
         pivot_avg_s = pivot_avg_s.reindex(columns=all_hours)
 
-    # Implied throughput = 3600 / (avg pick + switch) — used in chart 1 and gap chart
-    pivot_avg_tph = 3600.0 / (pivot_avg_s + _SWITCH_S)
+    # ── Weighted avg pick time for implied throughput ──────────────────────────
+    # Each task contributes its full duration, weighted by the fraction of the
+    # task attributed to that hour (matching the proportional task-count logic
+    # in throughput.py).  This ensures implied_capacity × fraction ≈ eff_tasks.
+    _hour_td2 = pd.Timedelta(hours=1)
+    _w_rows: list[dict] = []
+    for _, r in d.iterrows():
+        arr_hr = r["arr_ts"].floor("h")
+        tg_hr  = r["tg_ts"].floor("h")
+        dur    = r["pick_s"]
+        if dur <= 0:
+            continue
+        if arr_hr == tg_hr:
+            _w_rows.append({"station": r["station"], "hour_dt": arr_hr,
+                            "full_dur": dur, "frac": 1.0})
+        else:
+            h = arr_hr
+            while h <= tg_hr:
+                seg = (min(r["tg_ts"], h + _hour_td2) - max(r["arr_ts"], h)).total_seconds()
+                if seg > 0:
+                    _w_rows.append({"station": r["station"], "hour_dt": h,
+                                    "full_dur": dur, "frac": seg / dur})
+                h += _hour_td2
+    if _w_rows:
+        _wdf = pd.DataFrame(_w_rows)
+        _wdf["w_dur"] = _wdf["frac"] * _wdf["full_dur"]
+        _wg = _wdf.groupby(["station", "hour_dt"])
+        pivot_wavg_s = (_wg["w_dur"].sum() / _wg["frac"].sum()).unstack()
+        if all_hours is not None:
+            pivot_wavg_s = pivot_wavg_s.reindex(columns=all_hours)
+    else:
+        pivot_wavg_s = pivot_avg_s
 
-    fig = _station_hour_heatmap_toggle(pivot_med_s, pivot_avg_s, pivot_avg_tph, cfg)
+    # Implied throughput = 3600 / (weighted avg pick + switch)
+    pivot_avg_tph = 3600.0 / (pivot_wavg_s + _SWITCH_S)
+
+    fig = _station_hour_heatmap_toggle(pivot_med_s, pivot_wavg_s, pivot_avg_tph, cfg)
 
     # ── Raw data shared by the first two charts ──────────────────────────────
     # Per-station-hour summary (aggregated from time-sliced data)

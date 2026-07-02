@@ -4,9 +4,10 @@ analyses/throughput.py — completions per LABOR station per hour.
 Charts produced
 ---------------
 1. throughput_total       — Total triggerGo completions across all stations, hourly bar chart.
-2. throughput_heatmap     — Per-station Effective Tasks heatmap (capacity × active-time fraction),
-                            with toggle to % of Implied Throughput. Falls back to raw triggerGo
-                            counts if pick-time data is unavailable.
+2. throughput_heatmap     — Per-station Effective Tasks heatmap (actual completions with
+                            proportional hour-boundary attribution), with toggle to
+                            % of Implied Throughput. Falls back to raw triggerGo counts
+                            if pick-time data is unavailable.
 3. throughput_picker_rate — Per-station instantaneous hourly rate (rolling ROLL_MIN-min window),
                             minute-resolution line chart with horizontal range slider.
 4. throughput_utilisation — Per-station % of configured design rate, hourly heatmap.
@@ -149,32 +150,83 @@ def run(data: dict, cfg: dict) -> list[dict]:
 
                 util_pct_2d = (full_occ / 3600.0 * 100.0).values
 
-                # ── Effective Tasks: capacity × active_time_fraction ──
-                # Average pick time per station per hour
+                # ── Effective Tasks: actual completions with proportional hour attribution ──
+                # When a pick spans an hour boundary (arrived in hour A, triggerGo in hour B),
+                # credit is split proportionally by time spent in each hour.
                 pick_d["pick_s"] = (pick_d["tg_ts"] - pick_d["arr_ts"]).dt.total_seconds()
-                pick_d["hour"] = pick_d["arr_ts"].dt.floor("h")
-                avg_pick = pick_d.groupby(["station", "hour"])["pick_s"].mean()
-                avg_pick_2d = np.full_like(raw, np.nan)
-                for si, ws in enumerate(order):
-                    for hi, hr in enumerate(all_hours):
-                        if (ws, hr) in avg_pick.index:
-                            avg_pick_2d[si, hi] = avg_pick.loc[(ws, hr)]
+                effective_tasks_2d = np.zeros_like(raw, dtype=float)
+                ws_idx = {ws: i for i, ws in enumerate(order)}
+                hr_idx = {hr: j for j, hr in enumerate(all_hours)}
+                for _, row in pick_d.iterrows():
+                    si = ws_idx.get(row["station"])
+                    if si is None:
+                        continue
+                    arr_hr = row["arr_ts"].floor("h")
+                    tg_hr  = row["tg_ts"].floor("h")
+                    duration = row["pick_s"]
+                    if duration <= 0:
+                        continue
+                    if arr_hr == tg_hr:
+                        # Entire pick within one hour
+                        ji = hr_idx.get(arr_hr)
+                        if ji is not None:
+                            effective_tasks_2d[si, ji] += 1.0
+                    else:
+                        # Pick spans hour boundary — split proportionally
+                        boundary = tg_hr  # start of the completion hour
+                        secs_before = (boundary - row["arr_ts"]).total_seconds()
+                        frac_before = secs_before / duration
+                        frac_after  = 1.0 - frac_before
+                        ji_before = hr_idx.get(arr_hr)
+                        ji_after  = hr_idx.get(tg_hr)
+                        if ji_before is not None:
+                            effective_tasks_2d[si, ji_before] += frac_before
+                        if ji_after is not None:
+                            effective_tasks_2d[si, ji_after] += frac_after
+                # Mark inactive cells as NaN
+                effective_tasks_2d = np.where(raw == 0, np.nan, effective_tasks_2d)
 
-                # Where we have pick time data: capacity = 3600/(avg_pick+6)
-                # effective_tasks = capacity * active_time_fraction
-                active_frac = util_pct_2d / 100.0
+                # ── Implied capacity: weighted avg pick time using the same proportional fractions ──
+                # Each task contributes its full duration, weighted by the fraction of the
+                # task attributed to that hour. This keeps capacity consistent with
+                # effective_tasks so that a user can verify: eff_tasks / capacity = %.
+                weighted_sum = np.zeros_like(raw, dtype=float)  # sum(frac * duration)
+                weight_total = np.zeros_like(raw, dtype=float)  # sum(frac)
+                for _, row in pick_d.iterrows():
+                    si = ws_idx.get(row["station"])
+                    if si is None:
+                        continue
+                    arr_hr = row["arr_ts"].floor("h")
+                    tg_hr  = row["tg_ts"].floor("h")
+                    duration = row["pick_s"]
+                    if duration <= 0:
+                        continue
+                    if arr_hr == tg_hr:
+                        ji = hr_idx.get(arr_hr)
+                        if ji is not None:
+                            weighted_sum[si, ji] += duration
+                            weight_total[si, ji] += 1.0
+                    else:
+                        boundary = tg_hr
+                        secs_before = (boundary - row["arr_ts"]).total_seconds()
+                        frac_before = secs_before / duration
+                        frac_after  = 1.0 - frac_before
+                        ji_before = hr_idx.get(arr_hr)
+                        ji_after  = hr_idx.get(tg_hr)
+                        if ji_before is not None:
+                            weighted_sum[si, ji_before] += frac_before * duration
+                            weight_total[si, ji_before] += frac_before
+                        if ji_after is not None:
+                            weighted_sum[si, ji_after] += frac_after * duration
+                            weight_total[si, ji_after] += frac_after
+                avg_pick_2d = np.where(
+                    weight_total > 0, weighted_sum / weight_total, np.nan,
+                )
                 capacity_2d = np.where(
                     ~np.isnan(avg_pick_2d),
                     3600.0 / (avg_pick_2d + 6.0),
                     np.nan,
                 )
-                effective_tasks_2d = np.where(
-                    ~np.isnan(capacity_2d) & ~np.isnan(active_frac),
-                    capacity_2d * active_frac,
-                    np.nan,
-                )
-                # Zero out where raw counts are zero (station was inactive)
-                effective_tasks_2d = np.where(raw == 0, np.nan, effective_tasks_2d)
                 capacity_2d = np.where(raw == 0, np.nan, capacity_2d)
         except Exception:
             pass
@@ -366,16 +418,12 @@ def run(data: dict, cfg: dict) -> list[dict]:
 
     updatemenus: list[dict] = []
 
-    # Trace 1: implied throughput % (only when station-record data is available)
-    # When effective_tasks_2d is available, derive the % directly from
-    # effective_tasks_2d / capacity_2d * 100 so the surface math always closes:
-    #   capacity × (pct / 100) = effective_tasks  (exactly, not just approximately).
-    # When effective tasks are not available, fall back to raw util_pct_2d.
+    # Trace 1: % of implied throughput (effective_tasks / capacity, capped at 100%)
     if util_pct_2d is not None:
         if use_effective and capacity_2d is not None:
             implied_pct_2d = np.where(
                 ~np.isnan(effective_tasks_2d) & ~np.isnan(capacity_2d) & (capacity_2d > 0),
-                effective_tasks_2d / capacity_2d * 100.0,
+                np.minimum(effective_tasks_2d / capacity_2d * 100.0, 100.0),
                 np.nan,
             )
         else:
@@ -498,15 +546,13 @@ def run(data: dict, cfg: dict) -> list[dict]:
         "source":      "Labor station record (arrived→triggerGo pairs for pick time; pick+switch occupancy for active time)",
         "method":      (
             (
-                "Effective Tasks = Max Implied Capacity × Active Time Fraction, where "
-                "Capacity = 3 600 ÷ (mean pick time + 6 s) per station-hour — the 6 s accounts "
-                "for an unlogged handoff step present in every cycle — "
-                "and Active Time Fraction = (pick + switch seconds) ÷ 3 600. "
-                "The mean is used (not median) because it is the correct estimator for recovering "
-                "a count from total time: total_occupied_seconds ÷ mean_cycle_time = task count. "
-                "The % of Implied Throughput toggle (top-right) shows the exact active-time fraction "
-                "used in the Effective Tasks calculation, derived as Effective Tasks ÷ Capacity × 100 "
-                "so that capacity × (pct ÷ 100) = Effective Tasks exactly. "
+                "Effective Tasks = actual completed tasks (arrived→triggerGo pairs) with "
+                "proportional hour-boundary attribution. When a pick spans two hour buckets "
+                "(e.g. arrived at 10:55, triggerGo at 11:03), credit is split proportionally "
+                "by time spent in each hour (5/8 to 10:00, 3/8 to 11:00). "
+                "The % of Implied Throughput toggle (top-right) shows Effective Tasks as a "
+                "percentage of Implied Capacity, where Implied Capacity = 3 600 ÷ (mean pick "
+                "time + 6 s) per station-hour, capped at 100 %. "
                 "Dark cells are high-throughput station-hours; pale cells are low-activity periods."
             )
             if use_effective else
