@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from config import ACCENT, INK, MAX_OPERATIONAL_SWITCH_S, SWITCH_S_FALLBACK
+from config import ACCENT, INK, MAX_OPERATIONAL_SWITCH_S
+from analyses.switch_time import resolve_switch_s
 
 _log = logging.getLogger(__name__)
 
@@ -205,11 +206,15 @@ def run(data: dict, cfg: dict) -> list[dict]:
                     out=np.full_like(weighted_sum, np.nan),
                     where=weight_total > 0,
                 )
-                # Implied capacity uses a flat switch-time assumption (station-level
-                # switch measurement is unreliable with current logging quality).
+                # Implied capacity uses the user-configured switch time: the flat
+                # user-set value, or the per-station measured operational switch
+                # (see resolve_switch_s), broadcast down each station's row.
+                sw_col = np.array(
+                    [resolve_switch_s(cfg, ws) for ws in order], dtype=float,
+                )[:, None]
                 capacity_2d = np.where(
                     ~np.isnan(avg_pick_2d),
-                    3600.0 / (avg_pick_2d + SWITCH_S_FALLBACK),
+                    3600.0 / (avg_pick_2d + sw_col),
                     np.nan,
                 )
         except Exception as exc:
@@ -526,6 +531,19 @@ def run(data: dict, cfg: dict) -> list[dict]:
                 )
             _heatmap_rows.append(_row)
 
+    _sw_fixed = resolve_switch_s(cfg)
+    if cfg.get("switch_mode") == "measured":
+        _sw_phrase = (
+            "the per-station measured operational switch time (release→next arrived, gaps ≤ "
+            f"{MAX_OPERATIONAL_SWITCH_S/60:.0f} min), falling back to the user-set "
+            f"{cfg.get('switch_s_fixed', _sw_fixed):.0f} s where a station has no measured swaps"
+        )
+    else:
+        _sw_phrase = (
+            f"a flat, user-set {_sw_fixed:.0f} s assumption applied to every station (switch to "
+            "'measured' mode to use per-station measured switch time instead)"
+        )
+
     charts.append({
         "id":          "throughput_heatmap",
         "title":       "Effective Tasks per Station per Hour" if use_effective else "Throughput per Station per Hour (Heatmap)",
@@ -539,10 +557,8 @@ def run(data: dict, cfg: dict) -> list[dict]:
                 "by time spent in each hour (5/8 to 10:00, 3/8 to 11:00). "
                 "The % of Implied Throughput toggle (top-right) shows Effective Tasks as a "
                 "percentage of Implied Capacity, where Implied Capacity = 3 600 ÷ (mean pick "
-                f"time + {SWITCH_S_FALLBACK:.0f} s) per station-hour, capped at 100 %. The "
-                f"{SWITCH_S_FALLBACK:.0f} s switch time is a flat assumption based on "
-                "observational data in the field, not a per-station measurement — current "
-                "event logging isn't reliable enough to measure switch time station by station. "
+                f"time + switch time) per station-hour, capped at 100 %. The switch time is "
+                f"{_sw_phrase}. "
                 "Dark cells are high-throughput station-hours; pale cells are low-activity periods."
             )
             if use_effective else

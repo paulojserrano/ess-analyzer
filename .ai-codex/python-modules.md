@@ -1,7 +1,7 @@
-# Python Modules Map (generated 2026-07-01)
+# Python Modules Map (generated 2026-07-08)
 # Root-level modules: classes, methods, top-level functions
 
-## app.py  (1889 lines)
+## app.py  (2020 lines)
    app.py — Tkinter GUI for the ESS / ASRS Log Analyser.
 
    class AnalyzerApp
@@ -22,6 +22,7 @@
      def _clear_log                   (self)
      def _set_status                  (self, text: str)
      def _maybe_enable_run            (self)
+     def _refresh_analysis_availability (self)
      def _update_file_count           (self)
      def _on_ft_select                (self, _=None)
      def _set_all_checks              (self, value: bool)
@@ -60,20 +61,25 @@
      def _run_headless                (path: str)
      def main                         ()
 
-## config.py  (61 lines)
+## config.py  (64 lines)
    config.py — Single source of truth for all constants and palette definitions.
 
-## data_loader.py  (598 lines)
+## data_loader.py  (782 lines)
    data_loader.py — Excel ingestion, sheet-signature detection, and runtime config
 
    class ValidationResult
      def ok                           (self)
      def add_error                    (self, msg: str)
      def add_warning                  (self, msg: str)
+     def _found                       ()
 
    Top-level functions:
      def validate_file_path           (path: str)
      def validate_data                (data: dict[str, pd.DataFrame | None])
+     def best_preflight_status        (statuses: list[str])
+     def _analysis_status             (key: str, f: dict)
+     def _preflight_facts             (data: dict[str, pd.DataFrame | None])
+     def preflight_analyses           (data: dict[str, pd.DataFrame | None])
      def validate_user_config         (cfg: dict)
      def df_to_store                  (df: pd.DataFrame)
      def df_from_store                (json_str: str)

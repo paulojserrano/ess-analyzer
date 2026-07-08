@@ -1,4 +1,4 @@
-# Data Schema Reference (generated 2026-07-01)
+# Data Schema Reference (generated 2026-07-08)
 # Expected Excel sheets, column names, and runtime config keys
 
 ## Excel Sheets (auto-detected by signature columns)
@@ -32,7 +32,7 @@
 
 ## Stage Label Map (Chinese → English, from config.py)
   # ── Chinese column-prefix → English stage label ──────────────────────────────
-  # actual release→arrived gap cannot be measured from the station sheet.
+  # in "measured" mode when a station has no measurable release→arrived swaps.
   # A release→arrived gap longer than this is treated as starvation / idle time
 
 ## Runtime cfg Dict Keys (built by data_loader.build_config)
@@ -48,14 +48,19 @@
   stage_lbl            list[str]          Human-readable stage labels
   stage_col            list[str]          Hex colour per stage
   amr_type             str | None         Delivery AMR type string, e.g. "K50"
+  switch_s_fixed       float              User-set flat robot switch/wait time (s); default SWITCH_S_FALLBACK
+  switch_mode          str                "fixed" (use switch_s_fixed) or "measured" (per-station measured switch)
+  switch_measured      dict[str, float]   Per-station measured operational-switch median (s); {} if unavailable
 
 ## asrs_config.json (optional, placed next to .xlsx)
-  Keys: station_types, design_rates, type_colors, amr_type
+  Keys: station_types, design_rates, type_colors, amr_type, switch_s_fixed, switch_mode
   Example:
     { "station_types": {"LABOR-1": "Zone A"},
       "design_rates":  {"LABOR-1": 120},
       "type_colors":   {"Zone A": "#ff6b6b"},
-      "amr_type":      "K50" }
+      "amr_type":      "K50",
+      "switch_s_fixed": 6,
+      "switch_mode":   "fixed" }
 
 ## Location Code Formats
   LABOR station:   LABOR:0:<x>:<y>   (grouped by Y coord into zones A,B,C,...)

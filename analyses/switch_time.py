@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from config import INK, MAX_OPERATIONAL_SWITCH_S
+from config import INK, MAX_OPERATIONAL_SWITCH_S, SWITCH_S_FALLBACK
 
 _HEAT_COLORSCALE = [
     [0.0, "#f0f4ff"], [0.2, "#93c5fd"],
@@ -89,6 +89,32 @@ def operational_switch_by_station(lsr: pd.DataFrame, point2ws: dict) -> dict[str
     if op.empty:
         return {}
     return op.groupby("station")["gap_s"].median().to_dict()
+
+
+def resolve_switch_s(cfg: dict, station: str | None = None) -> float:
+    """Effective robot switch/wait time (s) for implied-throughput formulas.
+
+    The value is driven by two user-configurable cfg keys (see build_config):
+
+      • switch_mode == "fixed"    → the flat, user-set ``switch_s_fixed`` value
+                                     (default SWITCH_S_FALLBACK) for every station.
+      • switch_mode == "measured" → the per-station *measured* operational-switch
+                                     median (cfg["switch_measured"][station]),
+                                     falling back to ``switch_s_fixed`` where a
+                                     station has no measured swaps.
+
+    When ``station`` is None in measured mode, the fleet-level median of the
+    measured values is returned (again falling back to the fixed value).
+    """
+    fixed = float(cfg.get("switch_s_fixed", SWITCH_S_FALLBACK))
+    if cfg.get("switch_mode") != "measured":
+        return fixed
+    measured = cfg.get("switch_measured") or {}
+    if station is not None:
+        return float(measured.get(station, fixed))
+    if measured:
+        return float(np.median(list(measured.values())))
+    return fixed
 
 
 def _prep_arrays(pivot: pd.DataFrame, ws_order: list, fmt: str) -> tuple:

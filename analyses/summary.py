@@ -26,11 +26,10 @@ from config import (
     ACCENT,
     INK,
     MAX_OPERATIONAL_SWITCH_S,
-    SWITCH_S_FALLBACK,
     TOTAL_DURATION_COL,
 )
 from analyses.dwell_time import extract_picks
-from analyses.switch_time import _release_arrived_gaps
+from analyses.switch_time import _release_arrived_gaps, resolve_switch_s
 
 # One distinct colour per day (cycles if > 8 days)
 _DAY_PALETTE = [
@@ -93,15 +92,18 @@ def _collect_stats(all_days: list[dict]) -> list[dict]:
                     for ws, v in picks.groupby("station")["pick_s"].mean().items()
                 }
                 # util % per station: mean across hours of (actual / implied × 100),
-                # with implied capacity using a flat switch-time assumption based
-                # on observational data in the field (station-level switch time
-                # isn't reliably measurable with current logging quality).
+                # with implied capacity using the user-configured switch time
+                # (flat user-set value, or per-station measured switch — see
+                # resolve_switch_s).
                 per_hr = (
                     picks.groupby(["station", "hour_dt"])["pick_s"]
                     .agg(["mean", "size"])
                     .reset_index()
                 )
-                per_hr["implied"] = 3600.0 / (per_hr["mean"] + SWITCH_S_FALLBACK)
+                per_hr["switch_s"] = per_hr["station"].map(
+                    lambda ws: resolve_switch_s(day_cfg, ws)
+                )
+                per_hr["implied"] = 3600.0 / (per_hr["mean"] + per_hr["switch_s"])
                 per_hr["util"]    = per_hr["size"] / per_hr["implied"] * 100.0
                 avg_util_pct_by_station = {
                     str(ws): float(v)
@@ -454,10 +456,9 @@ def _avg_util_pct_trend(stats: list[dict]) -> dict | None:
         "figure":      fig,
         "source":      "All days",
         "method":      (
-            f"For each station-hour, implied throughput = 3 600 ÷ (avg pick time + "
-            f"{SWITCH_S_FALLBACK:.0f} s), where the switch time is a flat assumption based "
-            "on observational data in the field (station-level switch time isn't reliably "
-            "measurable with current logging quality). "
+            "For each station-hour, implied throughput = 3 600 ÷ (avg pick time + switch time), "
+            "where the switch time is the user-configured value — either a flat, user-set "
+            "assumption or, in 'measured' mode, the per-station measured operational switch time. "
             "Utilisation % = actual completions ÷ implied × 100. "
             "The value shown per station per day is the mean of that ratio across all active hours. "
             "100 % means the station was producing exactly as fast as operator speed allows. "
@@ -713,8 +714,6 @@ def _pick_r2_trend(all_days: list[dict]) -> dict | None:
     A high R² means operator speed is the dominant lever that day.
     A low R² means robot supply or other factors dominate.
     """
-    _SWITCH_S = 6.0  # keep consistent with dwell_time.py
-
     day_labels: list[str]        = []
     r2_vals:    list[float|None] = []
     slope_vals: list[float|None] = []

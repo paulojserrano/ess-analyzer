@@ -323,6 +323,9 @@ def generate_data_schema() -> str:
         ('stage_lbl',         'list[str]',          'Human-readable stage labels'),
         ('stage_col',         'list[str]',          'Hex colour per stage'),
         ('amr_type',          'str | None',         'Delivery AMR type string, e.g. "K50"'),
+        ('switch_s_fixed',    'float',              'User-set flat robot switch/wait time (s); default SWITCH_S_FALLBACK'),
+        ('switch_mode',       'str',                '"fixed" (use switch_s_fixed) or "measured" (per-station measured switch)'),
+        ('switch_measured',   'dict[str, float]',   'Per-station measured operational-switch median (s); {} if unavailable'),
     ]
     output.append(f"  {pad('key', 20)} {pad('type', 18)} description")
     output.append(f"  {'-'*20} {'-'*18} {'-'*30}")
@@ -332,12 +335,14 @@ def generate_data_schema() -> str:
 
     # ── asrs_config.json override ──
     output.append("## asrs_config.json (optional, placed next to .xlsx)")
-    output.append("  Keys: station_types, design_rates, type_colors, amr_type")
+    output.append("  Keys: station_types, design_rates, type_colors, amr_type, switch_s_fixed, switch_mode")
     output.append('  Example:')
     output.append('    { "station_types": {"LABOR-1": "Zone A"},')
     output.append('      "design_rates":  {"LABOR-1": 120},')
     output.append('      "type_colors":   {"Zone A": "#ff6b6b"},')
-    output.append('      "amr_type":      "K50" }')
+    output.append('      "amr_type":      "K50",')
+    output.append('      "switch_s_fixed": 6,')
+    output.append('      "switch_mode":   "fixed" }')
     output.append("")
 
     # ── Location code format ──

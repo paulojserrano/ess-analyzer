@@ -30,8 +30,11 @@ STAGE_LABEL_MAP: dict[str, str] = {
 TOTAL_DURATION_COL = "任务全程耗时(秒)"
 
 # ── Switch-time model (shared by dwell, throughput, switch, summary) ─────────
-# Fallback robot handoff time used in implied-throughput formulas when the
-# actual release→arrived gap cannot be measured from the station sheet.
+# Default robot handoff time used in implied-throughput formulas.  This is the
+# starting value for the user-configurable "switch/wait time" (set in the GUI
+# or via asrs_config.json "switch_s_fixed"); it is also the per-station fallback
+# in "measured" mode when a station has no measurable release→arrived swaps.
+# Resolved at runtime by analyses.switch_time.resolve_switch_s(cfg, station).
 SWITCH_S_FALLBACK = 6.0
 # A release→arrived gap longer than this is treated as starvation / idle time
 # (breaks, no demand, dispatch gaps) rather than an operational robot swap.

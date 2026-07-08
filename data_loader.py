@@ -14,9 +14,11 @@ import pandas as pd
 
 from config import (
     AMR_DELIVERY_TYPE_HINT,
+    ANALYSIS_MODULES,
     AUTO_TYPE_PALETTE,
     STAGE_COLORS,
     STAGE_LABEL_MAP,
+    SWITCH_S_FALLBACK,
     TOTAL_DURATION_COL,
 )
 
@@ -87,6 +89,10 @@ _EXPECTED_COLUMNS: dict[str, list[str]] = {
 }
 
 _MIN_ROWS = 10  # sheets with fewer rows than this trigger a warning
+
+# Minimum 'ppReady' events for the station-readiness analysis to run.
+# Keep in sync with analyses/station_readiness.py (_MIN_PPREADY_EVENTS).
+_MIN_PPREADY_EVENTS = 50
 
 
 def validate_data(data: dict[str, pd.DataFrame | None]) -> ValidationResult:
@@ -163,9 +169,149 @@ def _validate_sheet(
             )
 
 
+# ── Analysis preflight — which analyses can actually run on this data ─────────
+#
+# validate_data() checks sheet/column schema.  This goes one level deeper and
+# looks at the *event content* each analysis actually needs (e.g. the station
+# sheet must carry 'arrived'/'release' events, not just 'triggerGo'), so the GUI
+# can tell the user up front which analyses will run, be limited, or produce
+# nothing — instead of them silently returning [].
+
+# Status values, ordered from most to least capable (used when aggregating
+# across several loaded days: the best status any day achieves wins).
+PREFLIGHT_OK          = "ok"
+PREFLIGHT_DEGRADED    = "degraded"
+PREFLIGHT_UNAVAILABLE = "unavailable"
+_PREFLIGHT_RANK = {PREFLIGHT_OK: 2, PREFLIGHT_DEGRADED: 1, PREFLIGHT_UNAVAILABLE: 0}
+
+
+def best_preflight_status(statuses: list[str]) -> str:
+    """Return the most-capable status in a list (see _PREFLIGHT_RANK)."""
+    if not statuses:
+        return PREFLIGHT_UNAVAILABLE
+    return max(statuses, key=lambda s: _PREFLIGHT_RANK.get(s, 0))
+
+
+def _analysis_status(key: str, f: dict) -> tuple[str, str]:
+    """(status, reason) for one analysis given a facts dict from _preflight_facts.
+
+    Preconditions are kept coarse and stable — sheet presence plus which station
+    event types are logged — matching the guards inside each analysis module.
+    """
+    ev      = f["station_events"]
+    pp      = f["station_event_counts"].get("ppReady", 0)
+    have_st = f["has_station"]
+
+    def _found() -> str:
+        return ", ".join(sorted(ev)) if ev else "none"
+
+    if key == "throughput":
+        if not have_st or "triggerGo" not in ev:
+            return PREFLIGHT_UNAVAILABLE, "station sheet has no 'triggerGo' events to count completions"
+        if not {"arrived", "release"} <= ev:
+            return (PREFLIGHT_DEGRADED,
+                    "no 'arrived'/'release' events — completion counts work, but the "
+                    "'% of implied throughput' and active-time views will be blank")
+        return PREFLIGHT_OK, ""
+
+    if key == "dwell":
+        if not have_st or not {"arrived", "triggerGo"} <= ev:
+            return (PREFLIGHT_UNAVAILABLE,
+                    f"needs paired 'arrived'→'triggerGo' events (station sheet has: {_found()})")
+        return PREFLIGHT_OK, ""
+
+    if key == "switch":
+        if not have_st or not {"release", "arrived"} <= ev:
+            return (PREFLIGHT_UNAVAILABLE,
+                    f"needs 'release'→'arrived' gaps (station sheet has: {_found()})")
+        return PREFLIGHT_OK, ""
+
+    if key == "readiness":
+        if not have_st or pp < _MIN_PPREADY_EVENTS:
+            return (PREFLIGHT_UNAVAILABLE,
+                    f"needs at least {_MIN_PPREADY_EVENTS} 'ppReady' events (found {pp})")
+        if "arrived" not in ev:
+            return (PREFLIGHT_DEGRADED,
+                    "'ppReady' events present but no 'arrived' events to compare against")
+        return PREFLIGHT_OK, ""
+
+    if key in ("backlog", "retrieval"):
+        if not f["has_lifecycle"]:
+            return PREFLIGHT_UNAVAILABLE, "requires the lifecycle sheet, which is not present"
+        return PREFLIGHT_OK, ""
+
+    if key == "fleet":
+        if not f["has_lifecycle"] and not have_st:
+            return PREFLIGHT_UNAVAILABLE, "requires the lifecycle and/or station sheet"
+        if not f["has_lifecycle"]:
+            return (PREFLIGHT_DEGRADED,
+                    "no lifecycle sheet — only the fleet-utilisation timeseries runs "
+                    "(queue depth and Little's law are skipped)")
+        return PREFLIGHT_OK, ""
+
+    if key == "robot":
+        if not f["has_lifecycle"] and not have_st:
+            return PREFLIGHT_UNAVAILABLE, "requires the lifecycle or station sheet"
+        return PREFLIGHT_OK, ""
+
+    if key == "returns":
+        if not f["has_callback"]:
+            return PREFLIGHT_UNAVAILABLE, "requires the callback sheet, which is not present"
+        return PREFLIGHT_OK, ""
+
+    if key == "efficiency":
+        if not f["has_efficiency"]:
+            return PREFLIGHT_UNAVAILABLE, "requires the HPS3 efficiency sheet, which is not present"
+        return PREFLIGHT_OK, ""
+
+    if key == "quality":
+        return PREFLIGHT_OK, ""
+
+    # Unknown / disabled keys (e.g. cycle) — treat as ok so we never hide a
+    # module the registry adds later without a rule here.
+    return PREFLIGHT_OK, ""
+
+
+def _preflight_facts(data: dict[str, pd.DataFrame | None]) -> dict:
+    lsr = data.get("station")
+    events: dict[str, int] = {}
+    if lsr is not None and "事件类型" in lsr.columns:
+        events = {
+            str(k): int(v)
+            for k, v in lsr["事件类型"].dropna().astype(str).value_counts().items()
+        }
+    return {
+        "has_callback":         data.get("callback")   is not None,
+        "has_station":          lsr is not None,
+        "has_lifecycle":        data.get("lifecycle")  is not None,
+        "has_efficiency":       data.get("efficiency") is not None,
+        "station_events":       set(events.keys()),
+        "station_event_counts": events,
+    }
+
+
+def preflight_analyses(data: dict[str, pd.DataFrame | None]) -> list[dict]:
+    """Report which analyses can run against `data`.
+
+    Returns one dict per analysis in ANALYSIS_MODULES order:
+        {"key", "label", "status", "reason"}
+    where status is one of PREFLIGHT_OK / PREFLIGHT_DEGRADED / PREFLIGHT_UNAVAILABLE.
+    'reason' is a human-readable explanation (empty when status is OK).
+    """
+    facts = _preflight_facts(data)
+    findings: list[dict] = []
+    for key, label in ANALYSIS_MODULES:
+        status, reason = _analysis_status(key, facts)
+        findings.append({"key": key, "label": label, "status": status, "reason": reason})
+    return findings
+
+
 # ── User config validation ───────────────────────────────────────────────────
 
-_USER_CFG_KEYS = {"station_types", "design_rates", "type_colors", "amr_type"}
+_USER_CFG_KEYS = {
+    "station_types", "design_rates", "type_colors", "amr_type",
+    "switch_s_fixed", "switch_mode",
+}
 
 
 def validate_user_config(cfg: dict) -> ValidationResult:
@@ -196,6 +342,20 @@ def validate_user_config(cfg: dict) -> ValidationResult:
         vr.add_error(
             f"asrs_config.json 'amr_type' must be a string, "
             f"got {type(amr).__name__}."
+        )
+
+    sw = cfg.get("switch_s_fixed")
+    if sw is not None and (not isinstance(sw, (int, float)) or isinstance(sw, bool) or sw < 0):
+        vr.add_error(
+            f"asrs_config.json 'switch_s_fixed' must be a non-negative number, "
+            f"got {sw!r}."
+        )
+
+    mode = cfg.get("switch_mode")
+    if mode is not None and mode not in ("fixed", "measured"):
+        vr.add_error(
+            f"asrs_config.json 'switch_mode' must be 'fixed' or 'measured', "
+            f"got {mode!r}."
         )
 
     # design_rates values must be numeric
@@ -584,6 +744,27 @@ def build_config(
         _detect_amr_type(lsr) if lsr is not None else None
     )
 
+    # Robot switch/wait time model (drives implied-throughput formulas).
+    #   switch_s_fixed  : user-set flat handoff time (default SWITCH_S_FALLBACK).
+    #   switch_mode     : "fixed" uses that flat value everywhere; "measured"
+    #                     uses the per-station measured operational-switch median
+    #                     (switch_measured), falling back to the fixed value.
+    try:
+        switch_s_fixed = float(user_cfg.get("switch_s_fixed", SWITCH_S_FALLBACK))
+        if switch_s_fixed < 0:
+            switch_s_fixed = SWITCH_S_FALLBACK
+    except (TypeError, ValueError):
+        switch_s_fixed = SWITCH_S_FALLBACK
+    switch_mode = user_cfg.get("switch_mode", "fixed")
+    if switch_mode not in ("fixed", "measured"):
+        switch_mode = "fixed"
+    switch_measured: dict[str, float] = {}
+    if lsr is not None and point2ws:
+        # Imported lazily to avoid coupling the loader to the analyses package
+        # at import time.
+        from analyses.switch_time import operational_switch_by_station
+        switch_measured = operational_switch_by_station(lsr, point2ws)
+
     return {
         "point2ws":          point2ws,
         "ws_order":          ws_order,
@@ -595,4 +776,7 @@ def build_config(
         "stage_lbl":         stage_lbl,
         "stage_col":         stage_col,
         "amr_type":          amr_type,
+        "switch_s_fixed":    switch_s_fixed,
+        "switch_mode":       switch_mode,
+        "switch_measured":   switch_measured,
     }

@@ -25,7 +25,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from config import AUTO_TYPE_PALETTE, INK, SWITCH_S_FALLBACK
+from config import AUTO_TYPE_PALETTE, INK, MAX_OPERATIONAL_SWITCH_S
+from analyses.switch_time import resolve_switch_s
 
 # Low value = good (fast picks)
 _HEAT_COLORSCALE = [
@@ -455,11 +456,14 @@ def run(data: dict, cfg: dict) -> list[dict]:
         if all_hours is not None:
             pivot_wavg_s = pivot_wavg_s.reindex(columns=all_hours)
 
-    # ── Implied throughput = 3600 / (weighted avg pick + flat switch assumption) ──
-    # Station-level switch time isn't reliably measurable with current logging
-    # quality, so implied throughput uses a flat field-observed assumption
-    # (see switch_time.py's switch_heatmap chart for measured switch time).
-    pivot_avg_tph = 3600.0 / (pivot_wavg_s + SWITCH_S_FALLBACK)
+    # ── Implied throughput = 3600 / (weighted avg pick + switch time) ──────────
+    # The switch term is user-configurable (see resolve_switch_s): either the
+    # flat, user-set value or the per-station measured operational switch time.
+    _sw_series = pd.Series(
+        {ws: resolve_switch_s(cfg, ws) for ws in pivot_wavg_s.index},
+        dtype=float,
+    )
+    pivot_avg_tph = 3600.0 / pivot_wavg_s.add(_sw_series, axis=0)
 
     fig = _station_hour_heatmap_toggle(pivot_med_s, pivot_wavg_s, pivot_avg_tph, cfg)
 
@@ -468,14 +472,15 @@ def run(data: dict, cfg: dict) -> list[dict]:
     _dwell_summary_rows = []
     for (_ws, _hr), _sub in d.groupby(["station", "hour_dt"])["pick_s"]:
         _mean = float(_sub.mean())
+        _sw   = resolve_switch_s(cfg, _ws)
         _dwell_summary_rows.append({
             "station":   _ws,
             "hour":      _hr.strftime("%H:%M") if hasattr(_hr, "strftime") else str(_hr),
             "median_s":  round(float(_sub.median()), 2),
             "mean_s":    round(_mean, 2),
             "count":     int(len(_sub)),
-            "switch_s_used": SWITCH_S_FALLBACK,
-            "implied_tph_avg": round(3600.0 / (_mean + SWITCH_S_FALLBACK), 2) if _mean > 0 else None,
+            "switch_s_used": round(_sw, 2),
+            "implied_tph_avg": round(3600.0 / (_mean + _sw), 2) if _mean > 0 else None,
         })
     # Individual pick events (full resolution — original durations for distribution)
     _dwell_all_rows = pd.DataFrame({
@@ -484,11 +489,19 @@ def run(data: dict, cfg: dict) -> list[dict]:
         "pick_s":  d["pick_s"].astype(float).round(2),
     }).to_dict("records")
 
-    _sw_note = (
-        f"a flat {SWITCH_S_FALLBACK:.0f} s assumption based on observational data in the "
-        "field (station-level switch time isn't reliably measurable with current logging "
-        "quality — see the Robot Switch Time chart for measured median/average switch time)"
-    )
+    _sw_fixed = resolve_switch_s(cfg)
+    if cfg.get("switch_mode") == "measured":
+        _sw_note = (
+            "the per-station measured operational switch time (release→next arrived, "
+            f"gaps ≤ {MAX_OPERATIONAL_SWITCH_S/60:.0f} min), falling back to the user-set "
+            f"{cfg.get('switch_s_fixed', _sw_fixed):.0f} s where a station has no measured swaps"
+        )
+    else:
+        _sw_note = (
+            f"a flat, user-set {_sw_fixed:.0f} s assumption (station-level switch time isn't "
+            "reliably measurable with current logging quality — switch to 'measured' mode or see "
+            "the Robot Switch Time chart for measured median/average switch time)"
+        )
 
     charts = [{
         "id":          "dwell_heatmap",

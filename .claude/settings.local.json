@@ -41,7 +41,10 @@
       "PowerShell(python ai_codex.py)",
       "Bash(pip install *)",
       "Bash(python -c ' *)",
-      "Bash(python -m py_compile analyses/throughput.py analyses/dwell_time.py analyses/summary.py)"
+      "Bash(python -m py_compile analyses/throughput.py analyses/dwell_time.py analyses/summary.py)",
+      "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python -)",
+      "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python ai_codex.py)"
     ]
   }
 }

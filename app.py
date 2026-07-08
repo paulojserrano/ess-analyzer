@@ -23,16 +23,20 @@ import threading
 import traceback
 
 from data_loader import (
+    PREFLIGHT_OK,
+    PREFLIGHT_UNAVAILABLE,
+    best_preflight_status,
     build_config,
     detect_data_date,
     filter_to_peak_day,
     load_data,
     load_log_day,
     load_user_config,
+    preflight_analyses,
     validate_data,
     validate_file_path,
 )
-from config import ANALYSIS_MODULES, AUTO_TYPE_PALETTE, DEFAULT_CHECKED
+from config import ANALYSIS_MODULES, AUTO_TYPE_PALETTE, DEFAULT_CHECKED, SWITCH_S_FALLBACK
 from analyses import (
     backlog,
     data_quality,
@@ -92,6 +96,47 @@ def _sort_registry(registry: list[dict]) -> list[dict]:
 # ── human-readable step labels ───────────────────────────────────────────────
 _STEP_LABEL = {key: lbl for key, lbl in ANALYSIS_MODULES}
 
+
+class _Tooltip:
+    """Lightweight hover tooltip for a Tk widget.
+
+    `text_fn` is called each time the pointer enters the widget and should
+    return the current tooltip text (or "" / None to show nothing) — this lets
+    the same tooltip track state that changes as files are loaded.
+    """
+
+    def __init__(self, widget, text_fn):
+        import tkinter as tk
+        self._tk      = tk
+        self._widget  = widget
+        self._text_fn = text_fn
+        self._tip     = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
+
+    def _show(self, _e=None):
+        if self._tip is not None:
+            return
+        text = self._text_fn()
+        if not text:
+            return
+        x = self._widget.winfo_rootx() + 24
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._tip = tw = self._tk.Toplevel(self._widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        self._tk.Label(
+            tw, text=text, justify="left",
+            bg="#0f172a", fg="#f8fafc", font=("Segoe UI", 8),
+            padx=9, pady=7, wraplength=340, relief="solid", bd=1,
+        ).pack()
+
+    def _hide(self, _e=None):
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
 # ── file picker (CLI fallback) ────────────────────────────────────────────────
 
 def pick_file() -> str:
@@ -145,7 +190,9 @@ class AnalyzerApp:
         self.root = tk.Tk()
         self.root.title("Hai Robotics ESS Analyzer")
         self.root.geometry("1200x820")
-        self.root.minsize(960, 680)
+        # Kept modest so the window can be shrunk well below full screen; the
+        # scrollable body (see _build) keeps every card reachable.
+        self.root.minsize(820, 520)
         self.root.configure(bg=self.BG)
 
         self._q               = _queue.Queue()
@@ -168,6 +215,18 @@ class AnalyzerApp:
         self._ready_announced  = False
 
         self._checks = {key: tk.BooleanVar(value=key in DEFAULT_CHECKED) for key, _ in ANALYSIS_MODULES}
+        # Checkbutton widgets + their base labels, so availability markers can be
+        # applied/removed as files are loaded (see _refresh_analysis_availability).
+        self._check_widgets: dict = {}
+        self._check_labels:  dict = {}
+        # Per-analysis "what's missing" detail, shown on hover over a ⚠ checkbox.
+        self._check_reasons: dict = {}
+
+        # Robot switch/wait time model (used by implied-throughput / utilisation).
+        # The entry holds the flat fallback value; the checkbox selects whether
+        # implied rates use that flat value or the per-station measured switch time.
+        self._switch_s_var        = tk.StringVar(value=f"{SWITCH_S_FALLBACK:g}")
+        self._switch_measured_var = tk.BooleanVar(value=False)
 
         self._setup_styles()
         self._build()
@@ -253,12 +312,49 @@ class AnalyzerApp:
                                            style="Status.TLabel")
         self._status_lbl.pack(side="left", padx=8, pady=4)
 
-        # ── Body (card-based 2-column grid) ───────────────────────────────────
-        body = tk.Frame(self.root, bg=self.BG, padx=16, pady=12)
-        body.pack(fill="both", expand=True)
+        # ── Body: scrollable, card-based 2-column grid ────────────────────────
+        # The cards live inside a canvas so every one stays reachable when the
+        # window is smaller than the content (i.e. not maximised) — a vertical
+        # scrollbar appears on demand.  When the window is larger than the
+        # content, the inner frame is stretched to fill it so big screens still
+        # look full and the log card expands as before.
+        body_wrap = tk.Frame(self.root, bg=self.BG)
+        body_wrap.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(body_wrap, bg=self.BG, highlightthickness=0)
+        vsb = self.ttk.Scrollbar(body_wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(canvas, bg=self.BG, padx=16, pady=12)
+        body_win = canvas.create_window((0, 0), window=body, anchor="nw")
+        self._body_canvas = canvas
+
         body.columnconfigure(0, weight=1, uniform="half")
         body.columnconfigure(1, weight=1, uniform="half")
         body.rowconfigure(2, weight=1)
+
+        def _reflow(_e=None):
+            cw = canvas.winfo_width()
+            ch = canvas.winfo_height()
+            if cw <= 1:                      # not mapped yet
+                return
+            # Match the inner frame's width to the viewport (horizontal
+            # responsiveness) and let it fill the viewport height when the
+            # content is shorter, otherwise use its natural height and scroll.
+            canvas.itemconfigure(body_win, width=cw,
+                                 height=max(body.winfo_reqheight(), ch))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        canvas.bind("<Configure>", _reflow)
+        body.bind("<Configure>", _reflow)
+        self.root.after_idle(_reflow)
+
+        # Mouse-wheel scrolling while the pointer is anywhere over the body;
+        # the log's own text area keeps its wheel when hovered directly.
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", self._on_body_wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
         # Row 0: Input Files | Detected Stations
         self._build_files_card(body, 0, 0)
@@ -270,6 +366,19 @@ class AnalyzerApp:
         self._build_log_card(body, 2)
 
         self.root.bind("<Control-o>", lambda _: self._browse())
+
+    def _on_body_wheel(self, e):
+        """Scroll the body canvas, unless the pointer is over the log text
+        (which manages its own wheel)."""
+        w = self.root.winfo_containing(e.x_root, e.y_root)
+        log = getattr(self, "_log", None)
+        node = w
+        while node is not None:
+            if node is log:
+                log.yview_scroll(int(-e.delta / 120), "units")
+                return "break"
+            node = getattr(node, "master", None)
+        self._body_canvas.yview_scroll(int(-e.delta / 120), "units")
 
     def _make_card(self, parent, row, col, title, colspan=1, right_fn=None):
         """Create a bordered card frame with accent-stripe header. Returns content frame."""
@@ -416,14 +525,47 @@ class AnalyzerApp:
         c = self._make_card(parent, row, col, "ANALYSES", right_fn=_an_right)
 
         for key, lbl in ANALYSIS_MODULES:
-            self.ttk.Checkbutton(c, text=lbl,
-                                 variable=self._checks[key],
-                                 style="TCheckbutton").pack(
-                anchor="w", padx=8, pady=1)
+            w = self.ttk.Checkbutton(c, text=lbl,
+                                     variable=self._checks[key],
+                                     style="TCheckbutton")
+            w.pack(anchor="w", padx=8, pady=1)
+            self._check_widgets[key] = w
+            self._check_labels[key]  = lbl
+            # Hover a marked analysis to see exactly what's missing / limited.
+            _Tooltip(w, lambda k=key: self._check_reasons.get(k, ""))
+
+        # Availability summary — filled in once files are loaded. A ⚠ prefix on a
+        # checkbox means that analysis can't fully run on the loaded data; the
+        # analysis log lists the specific reason per file.
+        self._an_note = self.tk.Label(c, text="", bg=self.CARD, fg=self.AMBER,
+                                      font=("Segoe UI", 8), wraplength=260,
+                                      justify="left", anchor="w")
+        self._an_note.pack(anchor="w", padx=8, pady=(6, 2), fill="x")
 
     def _build_run_card(self, parent, row, col):
         tk = self.tk
         c = self._make_card(parent, row, col, "RUN & OUTPUT")
+
+        # ── Robot switch/wait time model ──────────────────────────────────────
+        sw = tk.Frame(c, bg=self.CARD)
+        sw.pack(fill="x", pady=(0, 8))
+        tk.Label(sw, text="Robot switch / wait time (s):", bg=self.CARD,
+                 fg=self.TEXT, font=("Segoe UI", 9)).pack(side="left")
+        self._switch_entry = self.ttk.Entry(sw, textvariable=self._switch_s_var,
+                                             width=6, style="TEntry")
+        self._switch_entry.pack(side="left", padx=(6, 0))
+        self.ttk.Checkbutton(
+            c, text="Use measured (actual) switch time per station",
+            variable=self._switch_measured_var, style="TCheckbutton",
+        ).pack(anchor="w", pady=(0, 2))
+        tk.Label(
+            c,
+            text=("Fixed: apply the value above to every station.  "
+                  "Measured: use each station's actual median swap, "
+                  "falling back to the value above."),
+            bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 7),
+            wraplength=260, justify="left",
+        ).pack(anchor="w", pady=(0, 8))
 
         self._run_btn = self.ttk.Button(c, text="▶   Run Analysis",
                                          style="Run.TButton",
@@ -470,7 +612,7 @@ class AnalyzerApp:
         lf.rowconfigure(0, weight=1)
 
         self._log = tk.Text(lf, wrap="word", bg="#f1f5f9", fg=self.TEXT,
-                            font=("Consolas", 9), state="disabled",
+                            font=("Consolas", 9), state="disabled", height=8,
                             relief="flat", bd=0, padx=12, pady=12,
                             selectbackground="#dbeafe")
         self._log.grid(row=0, column=0, sticky="nsew")
@@ -529,6 +671,76 @@ class AnalyzerApp:
                 self._log_write(
                     "⚠  No lifecycle sheet found — "
                     "Cycle Time and Retrieval will be skipped.\n\n", "warn")
+
+    def _refresh_analysis_availability(self):
+        """Mark analyses that can't fully run on the loaded data.
+
+        Aggregates the per-day preflight (best status any loaded day achieves),
+        prefixes a ⚠ to each affected checkbox, and stores the specific reason(s)
+        in self._check_reasons so hovering the checkbox shows exactly what's
+        missing.  Purely informational — nothing is disabled or unchecked.
+        """
+        if not self._check_widgets:
+            return
+
+        # No data yet → restore plain labels and clear reasons.
+        if not self._days:
+            for key, w in self._check_widgets.items():
+                w.configure(text=self._check_labels[key])
+            self._check_reasons.clear()
+            self._an_note.configure(text="")
+            return
+
+        multi = len(self._days) > 1
+        # key → list of (day_label, status, reason)
+        per_key: dict[str, list[tuple]] = {}
+        for d in self._days:
+            for f in preflight_analyses(d["data"]):
+                per_key.setdefault(f["key"], []).append(
+                    (d.get("label", "day"), f["status"], f["reason"]))
+
+        n_unavail = n_limited = 0
+        for key, w in self._check_widgets.items():
+            entries  = per_key.get(key, [])
+            statuses = [s for _, s, _ in entries]
+            agg      = best_preflight_status(statuses) if statuses else PREFLIGHT_OK
+            base     = self._check_labels[key]
+
+            if agg == PREFLIGHT_OK:
+                w.configure(text=base)
+                self._check_reasons.pop(key, None)
+                continue
+
+            tag = "unavailable" if agg == PREFLIGHT_UNAVAILABLE else "limited"
+            w.configure(text=f"⚠ {base}  — {tag}")
+            if agg == PREFLIGHT_UNAVAILABLE:
+                n_unavail += 1
+            else:
+                n_limited += 1
+
+            # Build the hover detail from the day(s) where it isn't fully OK.
+            bad = [(lbl, r) for lbl, s, r in entries if s != PREFLIGHT_OK and r]
+            uniq_reasons = list(dict.fromkeys(r for _, r in bad))
+            if multi and len(uniq_reasons) > 1:
+                detail = "\n".join(f"• {lbl}: {r}" for lbl, r in bad)
+            else:
+                detail = uniq_reasons[0] if uniq_reasons else ""
+            self._check_reasons[key] = f"{base} — {tag}\n\n{detail}" if detail else f"{base} — {tag}"
+
+        if n_unavail or n_limited:
+            parts = []
+            if n_unavail:
+                parts.append(f"{n_unavail} unavailable")
+            if n_limited:
+                parts.append(f"{n_limited} limited")
+            self._an_note.configure(
+                text="⚠ " + ", ".join(parts)
+                     + " with loaded data — hover a ⚠ analysis for details (also in the log).",
+                fg=self.AMBER)
+        else:
+            self._check_reasons.clear()
+            self._an_note.configure(text="✓ All analyses can run on the loaded data.",
+                                    fg=self.GREEN)
 
     def _update_file_count(self):
         """Refresh the small file-count badge in the file card header."""
@@ -714,6 +926,21 @@ class AnalyzerApp:
                     if date_lbl and date_lbl != label:
                         self._q.put(("log", (f"    • Date: {date_lbl}\n", "muted")))
 
+                    # ── Analysis preflight — which analyses can run on this data ──
+                    limited = [
+                        f for f in preflight_analyses(data)
+                        if f["status"] != PREFLIGHT_OK
+                    ]
+                    if limited:
+                        self._q.put(("log", (
+                            "    Some analyses are limited by this file's data:\n", "warn")))
+                        for f in limited:
+                            unavail = f["status"] == PREFLIGHT_UNAVAILABLE
+                            verb    = "unavailable" if unavail else "limited"
+                            self._q.put(("log", (
+                                f"      • {f['label']} — {verb}: {f['reason']}\n",
+                                "fail" if unavail else "warn")))
+
                     self._q.put(("day_ready", (p, date_lbl, data, cfg)))
                     self._q.put(("log", ("    ✓ Ready\n\n", "done")))
                 except Exception as e:
@@ -738,7 +965,9 @@ class AnalyzerApp:
             self._stn_status.configure(text="— load a file first")
             self._cfg             = None
             self._ready_announced = False
+            self._refresh_analysis_availability()
         else:
+            self._refresh_analysis_availability()
             self._maybe_enable_run()
 
     def _file_label_edit(self, event):
@@ -852,6 +1081,7 @@ class AnalyzerApp:
                         self._set_status(
                             f"Loading… ({self._loading_count} file"
                             f"{'s' if self._loading_count > 1 else ''} remaining)")
+                    self._refresh_analysis_availability()
                     self._maybe_enable_run()
 
                 elif kind == "day_err":
@@ -898,6 +1128,18 @@ class AnalyzerApp:
         cfg["type_colors"]       = tc
         cfg["design_rate"]       = design_rate
         cfg["design_total_rate"] = sum(design_rate.values()) if design_rate else None
+
+        # Robot switch/wait time model — captured from the RUN card controls.
+        try:
+            sw = float(self._switch_s_var.get())
+            if sw < 0:
+                sw = SWITCH_S_FALLBACK
+        except (ValueError, TypeError):
+            sw = SWITCH_S_FALLBACK
+        # Keep the entry showing the value actually used (repairs bad input).
+        self._switch_s_var.set(f"{sw:g}")
+        cfg["switch_s_fixed"] = sw
+        cfg["switch_mode"]    = "measured" if self._switch_measured_var.get() else "fixed"
         return cfg
 
     def _run(self):
@@ -976,7 +1218,12 @@ class AnalyzerApp:
                 day_outdir = os.path.join(base_outdir, safe)
                 os.makedirs(day_outdir, exist_ok=True)
 
-                day_cfg = build_config(data, {})
+                # Pass the switch settings so build_config computes each day's
+                # per-station measured switch times for "measured" mode.
+                day_cfg = build_config(data, {
+                    "switch_s_fixed": user_cfg.get("switch_s_fixed", SWITCH_S_FALLBACK),
+                    "switch_mode":    user_cfg.get("switch_mode", "fixed"),
+                })
                 day_cfg["type_map"]          = user_cfg["type_map"]
                 day_cfg["design_rate"]       = user_cfg["design_rate"]
                 day_cfg["design_total_rate"] = user_cfg["design_total_rate"]
@@ -1594,6 +1841,7 @@ class AnalyzerApp:
                 #      G=Actual_Completions  H=Util_fixed_%  I=Util_actual_%
                 if tp_sn and pick_sn and ws_order:
                     try:
+                        sw_fixed = cfg.get("switch_s_fixed", SWITCH_S_FALLBACK)
                         dwell_sn = _sn("dwell_derived", p)
                         dws      = wb.create_sheet(dwell_sn)
                         col_hdrs = [
@@ -1612,7 +1860,7 @@ class AnalyzerApp:
                             "(row value)", "(row value)",
                             f"AVERAGEIFS(pick_events[Pick_s], Station, Hour)",
                             f"AVERAGEIFS(switch_events[Switch_s], Station, Hour) — '' if no switch data",
-                            "3600 / (Avg_Pick_s + 6)  ← 6 s assumed fixed switch",
+                            f"3600 / (Avg_Pick_s + {sw_fixed:g})  ← {sw_fixed:g} s fixed switch (user-set)",
                             "3600 / (Avg_Pick_s + Avg_Switch_s)",
                             f"COUNTIFS(tp_events[Station], Station, tp_events[Hour], Hour)",
                             "Actual_Completions / Implied_TPH_fixed × 100",
@@ -1642,7 +1890,7 @@ class AnalyzerApp:
                                         f"'{switch_sn}'!$B:$B,$B{row}),\"\")")
 
                                 # E — implied TPH with fixed 6 s switch
-                                dws.cell(row, 5, f"=IFERROR(3600/(C{row}+6),\"\")")
+                                dws.cell(row, 5, f"=IFERROR(3600/(C{row}+{sw_fixed:g}),\"\")")
 
                                 # F — implied TPH with actual switch
                                 if switch_sn:

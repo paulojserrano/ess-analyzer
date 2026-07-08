@@ -1,4 +1,4 @@
-# Analyses Index (generated 2026-07-01)
+# Analyses Index (generated 2026-07-08)
 # Each module exports run(data, cfg) -> list[ChartResult]
 # ChartResult keys: id, title, figure, source, method, export_hint
 
@@ -46,7 +46,7 @@
      def _pick_crossval             (data: dict, cfg: dict)
      def run                        (data: dict, cfg: dict)
 
-## dwell_time.py  (537 lines)
+## dwell_time.py  (555 lines)
    analyses/dwell_time.py — operator pick time at workstations.
 
    Charts:
@@ -71,7 +71,7 @@
      def _bottleneck_color_map      (labels: list[str])
      def run                        (data: dict, cfg: dict)
 
-## fleet_utilization.py  (756 lines)
+## fleet_utilization.py  (753 lines)
    analyses/fleet_utilization.py — station queue depth and global fleet utilisation.
 
    Charts:
@@ -138,7 +138,7 @@
    Functions:
      def run                        (data: dict, cfg: dict)
 
-## summary.py  (1209 lines)
+## summary.py  (1206 lines)
    analyses/summary.py — cross-day trend charts for the Summary tab.
 
    Charts:
@@ -163,7 +163,7 @@
      def export_xlsx                (all_days: list[dict], outdir: str)
      def run                        (all_days: list[dict])
 
-## switch_time.py  (392 lines)
+## switch_time.py  (418 lines)
    analyses/switch_time.py — robot handoff / switch time and station starvation.
 
    Charts:
@@ -173,11 +173,12 @@
    Functions:
      def _release_arrived_gaps      (lsr: pd.DataFrame, point2ws: dict)
      def operational_switch_by_station (lsr: pd.DataFrame, point2ws: dict)
+     def resolve_switch_s           (cfg: dict, station: str | None = None)
      def _prep_arrays               (pivot: pd.DataFrame, ws_order: list, fmt: str)
      def _starvation_heatmap        (starved: pd.DataFrame, cfg: dict, all_hours: pd.DatetimeI...)
      def run                        (data: dict, cfg: dict)
 
-## throughput.py  (767 lines)
+## throughput.py  (757 lines)
    analyses/throughput.py — completions per LABOR station per hour.
 
    Charts:
