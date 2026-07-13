@@ -1,4 +1,4 @@
-# Data Schema Reference (generated 2026-07-08)
+# Data Schema Reference (generated 2026-07-13)
 # Expected Excel sheets, column names, and runtime config keys
 
 ## Excel Sheets (auto-detected by signature columns)
@@ -34,6 +34,7 @@
   # ── Chinese column-prefix → English stage label ──────────────────────────────
   # in "measured" mode when a station has no measurable release→arrived swaps.
   # A release→arrived gap longer than this is treated as starvation / idle time
+  # happens the GUI (or asrs_config.json) can fall back to 'ppReady'→'triggerGo'.
 
 ## Runtime cfg Dict Keys (built by data_loader.build_config)
   key                  type               description
@@ -51,16 +52,18 @@
   switch_s_fixed       float              User-set flat robot switch/wait time (s); default SWITCH_S_FALLBACK
   switch_mode          str                "fixed" (use switch_s_fixed) or "measured" (per-station measured switch)
   switch_measured      dict[str, float]   Per-station measured operational-switch median (s); {} if unavailable
+  pick_start_event     str                "arrived" (standard) or "ppReady" (fallback when export lacks arrived events)
 
 ## asrs_config.json (optional, placed next to .xlsx)
-  Keys: station_types, design_rates, type_colors, amr_type, switch_s_fixed, switch_mode
+  Keys: station_types, design_rates, type_colors, amr_type, switch_s_fixed, switch_mode, pick_start_event
   Example:
     { "station_types": {"LABOR-1": "Zone A"},
       "design_rates":  {"LABOR-1": 120},
       "type_colors":   {"Zone A": "#ff6b6b"},
       "amr_type":      "K50",
       "switch_s_fixed": 6,
-      "switch_mode":   "fixed" }
+      "switch_mode":   "fixed",
+      "pick_start_event": "arrived" }
 
 ## Location Code Formats
   LABOR station:   LABOR:0:<x>:<y>   (grouped by Y coord into zones A,B,C,...)

@@ -1,13 +1,20 @@
-# Python Modules Map (generated 2026-07-08)
+# Python Modules Map (generated 2026-07-13)
 # Root-level modules: classes, methods, top-level functions
 
-## app.py  (2020 lines)
+## app.py  (2249 lines)
    app.py — Tkinter GUI for the ESS / ASRS Log Analyser.
+
+   class _Tooltip
+     def __init__                     (self, widget, text_fn)
+     def _show                        (self, _e=None)
+     def _hide                        (self, _e=None)
 
    class AnalyzerApp
      def __init__                     (self)
      def _setup_styles                (self)
      def _build                       (self)
+     def _reflow                      (_e=None)
+     def _on_body_wheel               (self, e)
      def _make_card                   (self, parent, row, col, title, colspan=1, right_fn=None)
      def _build_files_card            (self, parent, row, col)
      def _fc_right                    (sh)
@@ -38,6 +45,7 @@
      def _commit                      (e=None)
      def _poll                        (self)
      def _cfg_from_tree               (self)
+     def _confirm_pick_source         (self)
      def _run                         (self)
      def __init__                     (self, q)
      def write                        (self, text)
@@ -61,10 +69,10 @@
      def _run_headless                (path: str)
      def main                         ()
 
-## config.py  (64 lines)
+## config.py  (72 lines)
    config.py — Single source of truth for all constants and palette definitions.
 
-## data_loader.py  (782 lines)
+## data_loader.py  (827 lines)
    data_loader.py — Excel ingestion, sheet-signature detection, and runtime config
 
    class ValidationResult
@@ -80,6 +88,7 @@
      def _analysis_status             (key: str, f: dict)
      def _preflight_facts             (data: dict[str, pd.DataFrame | None])
      def preflight_analyses           (data: dict[str, pd.DataFrame | None])
+     def pick_source_status           (data: dict[str, pd.DataFrame | None])
      def validate_user_config         (cfg: dict)
      def df_to_store                  (df: pd.DataFrame)
      def df_from_store                (json_str: str)

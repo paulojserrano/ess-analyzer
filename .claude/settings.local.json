@@ -44,7 +44,12 @@
       "Bash(python -m py_compile analyses/throughput.py analyses/dwell_time.py analyses/summary.py)",
       "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python -c ' *)",
       "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python -)",
-      "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python ai_codex.py)"
+      "Bash(PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python ai_codex.py)",
+      "PowerShell(python -m py_compile app.py config.py data_loader.py analyses/dwell_time.py)",
+      "PowerShell(if \\($?\\) { \"OK compile\" })",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \"import app; print\\('app imports OK'\\); print\\('has _confirm_pick_source:', hasattr\\(app.AnalyzerApp, '_confirm_pick_source'\\)\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \"import app; print\\('app OK'\\)\")"
     ]
   }
 }

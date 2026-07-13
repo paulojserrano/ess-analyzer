@@ -32,11 +32,18 @@ from data_loader import (
     load_data,
     load_log_day,
     load_user_config,
+    pick_source_status,
     preflight_analyses,
     validate_data,
     validate_file_path,
 )
-from config import ANALYSIS_MODULES, AUTO_TYPE_PALETTE, DEFAULT_CHECKED, SWITCH_S_FALLBACK
+from config import (
+    ANALYSIS_MODULES,
+    AUTO_TYPE_PALETTE,
+    DEFAULT_CHECKED,
+    PICK_START_EVENT_DEFAULT,
+    SWITCH_S_FALLBACK,
+)
 from analyses import (
     backlog,
     data_quality,
@@ -227,6 +234,11 @@ class AnalyzerApp:
         # implied rates use that flat value or the per-station measured switch time.
         self._switch_s_var        = tk.StringVar(value=f"{SWITCH_S_FALLBACK:g}")
         self._switch_measured_var = tk.BooleanVar(value=False)
+
+        # Pick-time source fallback.  When the loaded data has no 'arrived'
+        # events, pick time can be measured from 'ppReady'→'triggerGo' instead —
+        # the user confirms this before the run (see _confirm_pick_source).
+        self._pick_fallback_var = tk.BooleanVar(value=False)
 
         self._setup_styles()
         self._build()
@@ -566,6 +578,21 @@ class AnalyzerApp:
             bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 7),
             wraplength=260, justify="left",
         ).pack(anchor="w", pady=(0, 8))
+
+        # ── Pick-time source fallback ─────────────────────────────────────────
+        self.ttk.Checkbutton(
+            c, text="Use ppReady → triggerGo for pick time (fallback)",
+            variable=self._pick_fallback_var, style="TCheckbutton",
+        ).pack(anchor="w", pady=(0, 2))
+        self._pick_fallback_lbl = tk.Label(
+            c,
+            text=("Off: pick time uses the standard 'arrived → triggerGo'.  "
+                  "On: measure from 'ppReady → triggerGo' instead — for exports "
+                  "missing 'arrived' events.  You'll be asked to confirm at run time."),
+            bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 7),
+            wraplength=260, justify="left",
+        )
+        self._pick_fallback_lbl.pack(anchor="w", pady=(0, 8))
 
         self._run_btn = self.ttk.Button(c, text="▶   Run Analysis",
                                          style="Run.TButton",
@@ -1140,10 +1167,82 @@ class AnalyzerApp:
         self._switch_s_var.set(f"{sw:g}")
         cfg["switch_s_fixed"] = sw
         cfg["switch_mode"]    = "measured" if self._switch_measured_var.get() else "fixed"
+
+        # Pick-time source — 'ppReady' fallback when the box is ticked, else the
+        # standard 'arrived'.
+        cfg["pick_start_event"] = (
+            "ppReady" if self._pick_fallback_var.get() else PICK_START_EVENT_DEFAULT
+        )
         return cfg
+
+    def _confirm_pick_source(self) -> bool:
+        """Confirm the pick-time source before running.  Returns False to abort.
+
+        Pick time is normally measured from 'arrived'→'triggerGo'.  When the
+        loaded data has no 'arrived' events, this offers the 'ppReady'→'triggerGo'
+        fallback and asks the user to confirm it — satisfying the requirement that
+        the substitution is flagged and confirmed in the GUI before the report is
+        built.  Sets self._pick_fallback_var to reflect the confirmed choice.
+        """
+        # Only relevant when pick time is actually being produced.
+        dwell_var = self._checks.get("dwell")
+        if dwell_var is None or not dwell_var.get():
+            return True
+
+        from tkinter import messagebox
+
+        supports_arrived = any(
+            pick_source_status(d["data"])["arrived"] for d in self._days)
+        supports_ppready = any(
+            pick_source_status(d["data"])["ppready"] for d in self._days)
+
+        if self._pick_fallback_var.get():
+            # User pre-selected the fallback — confirm the non-standard substitution.
+            if not supports_ppready:
+                messagebox.showwarning(
+                    "ppReady fallback unavailable",
+                    "The ppReady → triggerGo pick-time fallback is enabled, but the "
+                    "loaded data does not have enough 'ppReady' events to use it.\n\n"
+                    "Pick time will be empty.  Untick the fallback to use the standard "
+                    "'arrived → triggerGo' measure if this data has 'arrived' events.",
+                )
+                return True
+            return messagebox.askokcancel(
+                "Confirm pick-time source",
+                "Pick time will be measured from 'ppReady → triggerGo' instead of the "
+                "standard 'arrived → triggerGo'.\n\n"
+                "This is an approximation (a slightly wider window) and should be used "
+                "only when 'arrived' events are missing.\n\nProceed?",
+            )
+
+        # Fallback not selected — if 'arrived' is missing but ppReady is available,
+        # flag it and offer the substitution now.
+        if not supports_arrived and supports_ppready:
+            resp = messagebox.askyesnocancel(
+                "Pick-time events missing",
+                "The 'arrived' events needed to measure pick time are missing from the "
+                "loaded data, but 'ppReady' events are present.\n\n"
+                "Use 'ppReady → triggerGo' as a fallback pick-time measure?\n\n"
+                "  • Yes — use the ppReady fallback\n"
+                "  • No — run without pick time\n"
+                "  • Cancel — don't run",
+            )
+            if resp is None:          # Cancel → abort the run
+                return False
+            if resp:                  # Yes → enable the fallback for this run
+                self._pick_fallback_var.set(True)
+                self._log_write(
+                    "ℹ Pick time will use the ppReady → triggerGo fallback "
+                    "('arrived' events are missing).\n", "warn")
+            return True
+
+        return True
 
     def _run(self):
         if self._running or not self._days or self._loading_count > 0:
+            return
+
+        if not self._confirm_pick_source():
             return
 
         user_cfg = self._cfg_from_tree()
@@ -1221,8 +1320,10 @@ class AnalyzerApp:
                 # Pass the switch settings so build_config computes each day's
                 # per-station measured switch times for "measured" mode.
                 day_cfg = build_config(data, {
-                    "switch_s_fixed": user_cfg.get("switch_s_fixed", SWITCH_S_FALLBACK),
-                    "switch_mode":    user_cfg.get("switch_mode", "fixed"),
+                    "switch_s_fixed":   user_cfg.get("switch_s_fixed", SWITCH_S_FALLBACK),
+                    "switch_mode":      user_cfg.get("switch_mode", "fixed"),
+                    "pick_start_event": user_cfg.get("pick_start_event",
+                                                     PICK_START_EVENT_DEFAULT),
                 })
                 day_cfg["type_map"]          = user_cfg["type_map"]
                 day_cfg["design_rate"]       = user_cfg["design_rate"]
@@ -2103,6 +2204,17 @@ def _run_headless(path: str):
         sys.exit(1)
 
     cfg      = build_config(data, user_cfg)
+
+    # Pick-time source: honour asrs_config.json if it set one; otherwise fall
+    # back to 'ppReady'→'triggerGo' automatically when the export lacks 'arrived'
+    # events (headless has no GUI to confirm in — this is the safe default).
+    if "pick_start_event" not in user_cfg:
+        psrc = pick_source_status(data)
+        if not psrc["arrived"] and psrc["ppready"]:
+            cfg["pick_start_event"] = "ppReady"
+            print("  [note] no 'arrived' events — pick time uses the "
+                  "ppReady → triggerGo fallback")
+
     registry: list[dict] = []
 
     for key, mod in _PIPELINE:

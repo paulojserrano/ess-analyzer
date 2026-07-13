@@ -1,4 +1,4 @@
-# Documentation Registry (generated 2026-07-08)
+# Documentation Registry (generated 2026-07-13)
 
 ## Markdown files in root/
   - CLAUDE.md

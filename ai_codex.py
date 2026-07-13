@@ -326,6 +326,7 @@ def generate_data_schema() -> str:
         ('switch_s_fixed',    'float',              'User-set flat robot switch/wait time (s); default SWITCH_S_FALLBACK'),
         ('switch_mode',       'str',                '"fixed" (use switch_s_fixed) or "measured" (per-station measured switch)'),
         ('switch_measured',   'dict[str, float]',   'Per-station measured operational-switch median (s); {} if unavailable'),
+        ('pick_start_event',  'str',                '"arrived" (standard) or "ppReady" (fallback when export lacks arrived events)'),
     ]
     output.append(f"  {pad('key', 20)} {pad('type', 18)} description")
     output.append(f"  {'-'*20} {'-'*18} {'-'*30}")
@@ -335,14 +336,15 @@ def generate_data_schema() -> str:
 
     # ── asrs_config.json override ──
     output.append("## asrs_config.json (optional, placed next to .xlsx)")
-    output.append("  Keys: station_types, design_rates, type_colors, amr_type, switch_s_fixed, switch_mode")
+    output.append("  Keys: station_types, design_rates, type_colors, amr_type, switch_s_fixed, switch_mode, pick_start_event")
     output.append('  Example:')
     output.append('    { "station_types": {"LABOR-1": "Zone A"},')
     output.append('      "design_rates":  {"LABOR-1": 120},')
     output.append('      "type_colors":   {"Zone A": "#ff6b6b"},')
     output.append('      "amr_type":      "K50",')
     output.append('      "switch_s_fixed": 6,')
-    output.append('      "switch_mode":   "fixed" }')
+    output.append('      "switch_mode":   "fixed",')
+    output.append('      "pick_start_event": "arrived" }')
     output.append("")
 
     # ── Location code format ──

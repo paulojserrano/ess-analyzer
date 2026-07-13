@@ -16,6 +16,8 @@ from config import (
     AMR_DELIVERY_TYPE_HINT,
     ANALYSIS_MODULES,
     AUTO_TYPE_PALETTE,
+    PICK_START_EVENT_DEFAULT,
+    PICK_START_EVENTS,
     STAGE_COLORS,
     STAGE_LABEL_MAP,
     SWITCH_S_FALLBACK,
@@ -215,9 +217,19 @@ def _analysis_status(key: str, f: dict) -> tuple[str, str]:
         return PREFLIGHT_OK, ""
 
     if key == "dwell":
-        if not have_st or not {"arrived", "triggerGo"} <= ev:
+        if not have_st or "triggerGo" not in ev:
             return (PREFLIGHT_UNAVAILABLE,
-                    f"needs paired 'arrived'→'triggerGo' events (station sheet has: {_found()})")
+                    f"needs 'triggerGo' events (station sheet has: {_found()})")
+        if "arrived" not in ev:
+            # No 'arrived' — the ppReady→triggerGo fallback can stand in, but only
+            # if the user confirms it in the GUI (see pick_source_status).
+            if pp >= _MIN_PPREADY_EVENTS:
+                return (PREFLIGHT_DEGRADED,
+                        "no 'arrived' events — pick time can fall back to "
+                        "'ppReady'→'triggerGo' if you confirm it before running (RUN card)")
+            return (PREFLIGHT_UNAVAILABLE,
+                    f"needs 'arrived'→'triggerGo' pairs, and too few 'ppReady' events "
+                    f"({pp}) to fall back on (station sheet has: {_found()})")
         return PREFLIGHT_OK, ""
 
     if key == "switch":
@@ -306,11 +318,30 @@ def preflight_analyses(data: dict[str, pd.DataFrame | None]) -> list[dict]:
     return findings
 
 
+def pick_source_status(data: dict[str, pd.DataFrame | None]) -> dict:
+    """Which pick-time start event(s) the station data supports.
+
+    Returns {"arrived": bool, "ppready": bool}:
+      • arrived  — standard 'arrived'→'triggerGo' picks are countable.
+      • ppready  — the 'ppReady'→'triggerGo' fallback is countable (enough
+                   ppReady events and triggerGo present) when 'arrived' is absent.
+    The GUI uses this to decide whether to offer / confirm the ppReady fallback.
+    """
+    facts   = _preflight_facts(data)
+    ev      = facts["station_events"]
+    pp      = facts["station_event_counts"].get("ppReady", 0)
+    have_tg = "triggerGo" in ev
+    return {
+        "arrived": have_tg and "arrived" in ev,
+        "ppready": have_tg and pp >= _MIN_PPREADY_EVENTS,
+    }
+
+
 # ── User config validation ───────────────────────────────────────────────────
 
 _USER_CFG_KEYS = {
     "station_types", "design_rates", "type_colors", "amr_type",
-    "switch_s_fixed", "switch_mode",
+    "switch_s_fixed", "switch_mode", "pick_start_event",
 }
 
 
@@ -356,6 +387,13 @@ def validate_user_config(cfg: dict) -> ValidationResult:
         vr.add_error(
             f"asrs_config.json 'switch_mode' must be 'fixed' or 'measured', "
             f"got {mode!r}."
+        )
+
+    pse = cfg.get("pick_start_event")
+    if pse is not None and pse not in PICK_START_EVENTS:
+        vr.add_error(
+            f"asrs_config.json 'pick_start_event' must be one of "
+            f"{', '.join(PICK_START_EVENTS)}, got {pse!r}."
         )
 
     # design_rates values must be numeric
@@ -758,6 +796,12 @@ def build_config(
     switch_mode = user_cfg.get("switch_mode", "fixed")
     if switch_mode not in ("fixed", "measured"):
         switch_mode = "fixed"
+
+    # Pick-time start event: 'arrived' (standard) or 'ppReady' (fallback when the
+    # export lacks 'arrived' events).  Chosen in the GUI or asrs_config.json.
+    pick_start_event = user_cfg.get("pick_start_event", PICK_START_EVENT_DEFAULT)
+    if pick_start_event not in PICK_START_EVENTS:
+        pick_start_event = PICK_START_EVENT_DEFAULT
     switch_measured: dict[str, float] = {}
     if lsr is not None and point2ws:
         # Imported lazily to avoid coupling the loader to the analyses package
@@ -779,4 +823,5 @@ def build_config(
         "switch_s_fixed":    switch_s_fixed,
         "switch_mode":       switch_mode,
         "switch_measured":   switch_measured,
+        "pick_start_event":  pick_start_event,
     }

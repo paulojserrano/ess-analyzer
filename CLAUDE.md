@@ -72,7 +72,7 @@ ess_analyzer/
 **`analyses/summary.py`** — Called with `all_days: list[dict]` (not the standard `run(data, cfg)` signature). Only invoked when ≥2 days are loaded.
 
 **Shared cross-module helpers** (import these instead of re-implementing):
-- `dwell_time.extract_picks(lsr, cfg)` — arrived→triggerGo pairing with the station-match guard; used by throughput, summary, data_quality.
+- `dwell_time.extract_picks(lsr, cfg)` — pick pairing (start-event → triggerGo) with the station-match guard; used by throughput, summary, data_quality. The start event is `cfg["pick_start_event"]`: `"arrived"` (default) or `"ppReady"` (fallback for exports missing `arrived` events — station comes from the triggerGo since ppReady locations are blank; confirmed in the GUI RUN card before running).
 - `dwell_time._clipped_occupancy(...)` — hour-boundary-clipped seconds-in-use; used by throughput, switch_time.
 - `switch_time.operational_switch_by_station(lsr, point2ws)` — measured per-station median switch (gaps ≤ `MAX_OPERATIONAL_SWITCH_S`); replaces the old fixed 6 s assumption everywhere (fallback `SWITCH_S_FALLBACK`, both in `config.py`).
 - `fleet_utilization._delivery_leg_col(tlc, cfg)` — delivery-leg column detection; used by retrieval, robot_performance.

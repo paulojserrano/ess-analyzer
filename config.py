@@ -40,6 +40,14 @@ SWITCH_S_FALLBACK = 6.0
 # (breaks, no demand, dispatch gaps) rather than an operational robot swap.
 MAX_OPERATIONAL_SWITCH_S = 300.0
 
+# ── Pick-time start event ────────────────────────────────────────────────────
+# Pick time is normally measured from each robot's 'arrived' event to its next
+# 'triggerGo'.  Some exports are missing 'arrived' events entirely; when that
+# happens the GUI (or asrs_config.json) can fall back to 'ppReady'→'triggerGo'.
+# Resolved from cfg["pick_start_event"]; must be one of these two values.
+PICK_START_EVENT_DEFAULT = "arrived"
+PICK_START_EVENTS = ("arrived", "ppReady")
+
 # ── AMR auto-detection hint: robot type name containing this string is treated
 #    as the delivery AMR (K50 equivalent).  Override via asrs_config.json. ───
 AMR_DELIVERY_TYPE_HINT = "50"

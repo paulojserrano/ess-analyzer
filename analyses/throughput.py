@@ -5,9 +5,10 @@ Charts produced
 ---------------
 1. throughput_total       — Total triggerGo completions across all stations, hourly bar chart.
 2. throughput_heatmap     — Per-station Effective Tasks heatmap (actual completions with
-                            proportional hour-boundary attribution), with toggle to
-                            % of Implied Throughput. Falls back to raw triggerGo counts
-                            if pick-time data is unavailable.
+                            proportional hour-boundary attribution), with toggles to
+                            % of Implied Throughput and to raw Actual Completions
+                            (plain triggerGo counts, no weighting). Falls back to raw
+                            triggerGo counts if pick-time data is unavailable.
 3. throughput_picker_rate — Per-station instantaneous hourly rate (rolling ROLL_MIN-min window),
                             minute-resolution line chart with horizontal range slider.
 4. throughput_utilisation — Per-station % of configured design rate, hourly heatmap.
@@ -456,41 +457,86 @@ def run(data: dict, cfg: dict) -> list[dict]:
             ),
             visible=False,
         ))
+
+        # Trace 2 (optional): raw actual completions — plain triggerGo counts per
+        # hour, with NO proportional hour-boundary weighting.  Only added when the
+        # default trace shows weighted Effective Tasks; if the default is already
+        # raw counts there is nothing extra to show.
+        raw_toggle = use_effective
+        if raw_toggle:
+            raw_actual_z = np.where(raw == 0, np.nan, raw)
+            text_raw_actual = [
+                [str(int(raw[i, j])) if raw[i, j] > 0 else "" for j in range(raw.shape[1])]
+                for i in range(raw.shape[0])
+            ]
+            _raw_vals = raw[raw > 0]
+            raw_avg = float(np.mean(_raw_vals))   if len(_raw_vals) else 0.0
+            raw_med = float(np.median(_raw_vals)) if len(_raw_vals) else 0.0
+            fig2.add_trace(go.Heatmap(
+                z=raw_actual_z, x=hour_labels, y=order,
+                colorscale=[
+                    [0.0, "#f7f7fb"], [0.25, "#5161a8"],
+                    [0.6, "#16213e"], [1.0, "#e94560"],
+                ],
+                text=text_raw_actual, texttemplate="%{text}", textfont=dict(size=8),
+                hovertemplate="<b>%{y}</b><br>%{x}<br>Completions: %{z:.0f}<extra></extra>",
+                colorbar=dict(title="Tasks", thickness=14, len=0.8),
+                visible=False,
+            ))
+
         default_btn_label = "Effective Tasks" if use_effective else "Actual Count"
+        _vis_default = [True, False, False]  if raw_toggle else [True, False]
+        _vis_implied = [False, True, False]  if raw_toggle else [False, True]
+        _buttons = [
+            dict(
+                label=default_btn_label,
+                method="update",
+                args=[
+                    {"visible": _vis_default},
+                    {
+                        "title.text": default_chart_title,
+                        "annotations[0].text": (
+                            f"Avg  <b>{overall_avg:,.1f}</b> /hr"
+                            f"  ·  Median  <b>{overall_med:,.1f}</b> /hr"
+                        ),
+                    },
+                ],
+            ),
+            dict(
+                label="% of Implied Throughput",
+                method="update",
+                args=[
+                    {"visible": _vis_implied},
+                    {
+                        "title.text": "% of Implied Throughput per Station per Hour",
+                        "annotations[0].text": (
+                            f"Avg  <b>{util_avg:.0f}</b> %"
+                            f"  ·  Median  <b>{util_med:.0f}</b> %"
+                        ),
+                    },
+                ],
+            ),
+        ]
+        if raw_toggle:
+            _buttons.append(dict(
+                label="Actual Completions",
+                method="update",
+                args=[
+                    {"visible": [False, False, True]},
+                    {
+                        "title.text": "Actual Completions per Station per Hour",
+                        "annotations[0].text": (
+                            f"Avg  <b>{raw_avg:,.1f}</b> /hr"
+                            f"  ·  Median  <b>{raw_med:,.1f}</b> /hr"
+                        ),
+                    },
+                ],
+            ))
         updatemenus.append(dict(
             type="buttons", direction="right",
             x=1.0, y=1.10, xanchor="right", yanchor="bottom",
             showactive=True,
-            buttons=[
-                dict(
-                    label=default_btn_label,
-                    method="update",
-                    args=[
-                        {"visible": [True, False]},
-                        {
-                            "title.text": default_chart_title,
-                            "annotations[0].text": (
-                                f"Avg  <b>{overall_avg:,.1f}</b> /hr"
-                                f"  ·  Median  <b>{overall_med:,.1f}</b> /hr"
-                            ),
-                        },
-                    ],
-                ),
-                dict(
-                    label="% of Implied Throughput",
-                    method="update",
-                    args=[
-                        {"visible": [False, True]},
-                        {
-                            "title.text": "% of Implied Throughput per Station per Hour",
-                            "annotations[0].text": (
-                                f"Avg  <b>{util_avg:.0f}</b> %"
-                                f"  ·  Median  <b>{util_med:.0f}</b> %"
-                            ),
-                        },
-                    ],
-                ),
-            ],
+            buttons=_buttons,
             bgcolor="white", bordercolor="#cccccc",
             font=dict(color=INK, size=11),
             pad=dict(r=4, t=4),
@@ -559,6 +605,9 @@ def run(data: dict, cfg: dict) -> list[dict]:
                 "percentage of Implied Capacity, where Implied Capacity = 3 600 ÷ (mean pick "
                 f"time + switch time) per station-hour, capped at 100 %. The switch time is "
                 f"{_sw_phrase}. "
+                "The Actual Completions toggle shows the plain triggerGo count per hour with "
+                "NO proportional weighting — each completion is credited whole to the hour its "
+                "triggerGo fired in, so a station-hour's value is a simple integer count. "
                 "Dark cells are high-throughput station-hours; pale cells are low-activity periods."
             )
             if use_effective else

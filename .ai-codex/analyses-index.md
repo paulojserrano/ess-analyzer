@@ -1,4 +1,4 @@
-# Analyses Index (generated 2026-07-08)
+# Analyses Index (generated 2026-07-13)
 # Each module exports run(data, cfg) -> list[ChartResult]
 # ChartResult keys: id, title, figure, source, method, export_hint
 
@@ -46,17 +46,21 @@
      def _pick_crossval             (data: dict, cfg: dict)
      def run                        (data: dict, cfg: dict)
 
-## dwell_time.py  (555 lines)
+## dwell_time.py  (788 lines)
    analyses/dwell_time.py — operator pick time at workstations.
 
    Charts:
      dwell_heatmap                       Operator Pick Time at Workstations
      dwell_pick_distribution             Pick Time Distribution by Workstation
+     dwell_pick_distribution_by_station  Pick Time Distribution — Select Workstation
 
    Functions:
+     def _station_color_map         (ws_order: list[str])
+     def resolve_pick_start_event   (cfg: dict)
      def extract_picks              (lsr: pd.DataFrame, cfg: dict)
      def _clipped_occupancy         (events, start_col, end_col, ws_order, all_hours)
      def _pick_time_distribution    (d: pd.DataFrame, cfg: dict)
+     def _pick_time_distribution_by_station (d: pd.DataFrame, cfg: dict)
      def run                        (data: dict, cfg: dict)
 
 ## efficiency.py  (270 lines)
@@ -178,7 +182,7 @@
      def _starvation_heatmap        (starved: pd.DataFrame, cfg: dict, all_hours: pd.DatetimeI...)
      def run                        (data: dict, cfg: dict)
 
-## throughput.py  (757 lines)
+## throughput.py  (806 lines)
    analyses/throughput.py — completions per LABOR station per hour.
 
    Charts:
