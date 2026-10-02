@@ -68,5 +68,36 @@ ANALYSIS_MODULES: list[tuple[str, str]] = [
     ("quality",    "Data quality & cross-validation"),
 ]
 
+# Implementing module for each registry key — the pipeline imports these with
+# importlib (see pipeline.py); nothing else imports analysis modules directly.
+ANALYSIS_IMPLEMENTATIONS: dict[str, str] = {
+    "throughput": "analyses.throughput",
+    "dwell":      "analyses.dwell_time",
+    "switch":     "analyses.switch_time",
+    "readiness":  "analyses.station_readiness",
+    "cycle":      "analyses.cycle_time",
+    "backlog":    "analyses.backlog",
+    "retrieval":  "analyses.retrieval",
+    "fleet":      "analyses.fleet_utilization",
+    "robot":      "analyses.robot_performance",
+    "returns":    "analyses.return_flow",
+    "efficiency": "analyses.efficiency",
+    "quality":    "analyses.data_quality",
+}
+
+# Analyses that need the lifecycle sheet and are skipped without it.
+LIFECYCLE_ONLY: set[str] = {"cycle", "retrieval", "backlog"}
+
+# Preferred chart order inside a day's report.  Listed IDs come first in this
+# order; all others follow in pipeline order.
+CHART_DISPLAY_ORDER: list[str] = [
+    "throughput_total",
+    "throughput_heatmap",
+    "dwell_heatmap",
+    "switch_heatmap",
+    "dwell_pick_distribution",
+    "throughput_picker_rate",
+]
+
 # Analyses checked by default in the GUI
 DEFAULT_CHECKED: set[str] = {"throughput", "dwell", "switch"}

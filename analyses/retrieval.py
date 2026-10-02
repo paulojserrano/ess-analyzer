@@ -149,7 +149,7 @@ def _bay_heatmap(src: pd.DataFrame) -> dict:
     _bay_rows = [
         {"aisle": str(aisles[_ai]), "bay": int(_b), "retrievals": int(gv[_ai, _bi])}
         for _ai in range(len(aisles))
-        for _bi, _b in enumerate(range(1, max_bay + 1))
+        for _bi, _b in enumerate(bays)
         if gv[_ai, _bi] > 0
     ]
 

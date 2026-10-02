@@ -162,14 +162,14 @@ def _station_hour_heatmap_toggle(
 
     fig = go.Figure()
     fig.add_trace(go.Heatmap(
-        z=np.clip(med_arr, 0, vmax).tolist(),
+        z=med_arr.tolist(),
         text=med_text,
         hovertemplate="<b>%{y}</b><br>%{x}<br>Median: %{z:.0f}s<extra></extra>",
         visible=True,
         **common,
     ))
     fig.add_trace(go.Heatmap(
-        z=np.clip(avg_arr, 0, vmax).tolist(),
+        z=avg_arr.tolist(),
         text=avg_text,
         hovertemplate="<b>%{y}</b><br>%{x}<br>Average: %{z:.0f}s<extra></extra>",
         visible=False,
@@ -190,7 +190,7 @@ def _station_hour_heatmap_toggle(
                     label="Median",
                     method="restyle",
                     args=[{
-                        "z":    [np.clip(med_arr, 0, vmax).tolist(), np.clip(avg_arr, 0, vmax).tolist()],
+                        "z":    [med_arr.tolist(), avg_arr.tolist()],
                         "text": [med_text, avg_text],
                         "visible": [True, False],
                     }, [0, 1]],
@@ -199,7 +199,7 @@ def _station_hour_heatmap_toggle(
                     label="Average",
                     method="restyle",
                     args=[{
-                        "z":    [np.clip(med_arr, 0, vmax).tolist(), np.clip(avg_arr, 0, vmax).tolist()],
+                        "z":    [med_arr.tolist(), avg_arr.tolist()],
                         "text": [med_text, avg_text],
                         "visible": [False, True],
                     }, [0, 1]],
