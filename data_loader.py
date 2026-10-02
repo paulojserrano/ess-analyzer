@@ -139,14 +139,6 @@ def row_timestamps(df: pd.DataFrame, key: str) -> pd.Series | None:
     return out
 
 
-def best_ts_column(df: pd.DataFrame, key: str) -> str | None:
-    """The preferred time column that actually contains parseable values."""
-    for c in _ts_candidates(df, key):
-        if pd.to_datetime(df[c], errors="coerce").notna().any():
-            return c
-    return None
-
-
 def validate_data(data: dict[str, pd.DataFrame | None]) -> ValidationResult:
     """Validate loaded sheet data for schema conformance and quality."""
     vr = ValidationResult()

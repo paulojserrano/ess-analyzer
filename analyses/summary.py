@@ -713,7 +713,6 @@ def _pick_r2_trend(all_days: list[dict]) -> dict | None:
     for day in all_days:
         label = day["label"]
         lsr   = day["data"].get("station")
-        cb    = day["data"].get("callback")
         cfg   = day.get("cfg", {})
 
         day_labels.append(label)

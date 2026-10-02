@@ -701,8 +701,8 @@ All pick-completion counts and pick-time measurements therefore use <code>trigge
 
 <h3>1.2 Implied throughput ceiling</h3>
 <p>The theoretical maximum throughput a station can sustain given observed pick times:</p>
-<div class="formula">ImpliedTPH(station, hour) = 3 600 / (AvgPickTime(station, hour) + 6)</div>
-<p><code>AvgPickTime</code> is the mean <code>arrived→triggerGo</code> duration (s) for that station-hour, also bucketed by <code>triggerGo</code> time. The constant <strong>6 s</strong> is a fixed robot-handoff overhead added to every cycle.</p>
+<div class="formula">ImpliedTPH(station, hour) = 3 600 / (AvgPickTime(station, hour) + Switch(station))</div>
+<p><code>AvgPickTime</code> is the mean pick duration (s) of picks starting in that station-hour. <code>Switch</code> is the robot-handoff overhead chosen for the run: a fixed value (default 6 s) or, in measured mode, the station's median operational switch time (gaps ≤ 5 min).</p>
 
 <h3>1.3 Utilisation %</h3>
 <div class="formula">Utilisation(station, hour) = T(station, hour) / ImpliedTPH(station, hour) × 100 %</div>
@@ -735,7 +735,7 @@ All pick-completion counts and pick-time measurements therefore use <code>trigge
 <p>Bucketing uses the <code>arrived</code> timestamp so the distribution reflects when work started.</p>
 
 <h3>2.2 Implied throughput</h3>
-<div class="formula">ImpliedTPH(station, hour) = 3 600 / (MeanPickTime(station, hour) + 6)</div>
+<div class="formula">ImpliedTPH(station, hour) = 3 600 / (MeanPickTime(station, hour) + Switch(station))</div>
 
 <h3>2.3 Distribution</h3>
 <ul>
@@ -768,7 +768,7 @@ All pick-completion counts and pick-time measurements therefore use <code>trigge
 <h3>3.1 Definition</h3>
 <p>Switch time is the gap between one robot leaving a station and the next robot arriving:</p>
 <div class="formula">SwitchTime = next_arrived.timestamp − release.timestamp   (seconds)</div>
-<p>Measured per station sequentially: for each <code>release</code> event, the switch time is the gap to the immediately following <code>arrived</code> at the same station, regardless of robot identity. Valid range: 0–7 200 s.</p>
+<p>Measured per station sequentially: for each <code>release</code> event, the switch time is the gap to the immediately following <code>arrived</code> at the same station, regardless of robot identity. Gaps ≤ 300 s are operational switches (switch-time statistics and occupancy); gaps of 300 s–2 h are starvation episodes (Station Starvation chart) and never count as switch time; longer gaps are shift boundaries and ignored.</p>
 
 <h3>3.2 Aggregation</h3>
 <div class="formula">MedianSwitchTime(station, hour) = median { SwitchTime_i : station, hour }
@@ -903,12 +903,12 @@ K50_util%(t)      = K50_concurrent(t) / total_K50_fleet × 100 %</div>
 <tr><td>Median cycle time (min)</td><td>median(<code>任务全程耗时(秒)</code>) / 60, filtered 0–7 200 s</td></tr>
 <tr><td>p90 cycle time (min)</td><td>90th percentile of the same series</td></tr>
 <tr><td>Avg pick time (s)</td><td>Mean of all <code>arrived→triggerGo</code> durations, 0–3 600 s</td></tr>
-<tr><td>Median switch time (s)</td><td>Median of all <code>release→arrived</code> gaps, 0–7 200 s</td></tr>
+<tr><td>Median switch time (s)</td><td>Median of operational <code>release→arrived</code> gaps (≤ 300 s)</td></tr>
 </table>
 
 <h3>7.2 Pick rate utilisation %</h3>
 <p>For each station-hour, the fraction of throughput captured relative to the operator-speed ceiling:</p>
-<div class="formula">ImpliedTPH(station, hour) = 3 600 / (AvgPickTime(station, hour) + 6)
+<div class="formula">ImpliedTPH(station, hour) = 3 600 / (AvgPickTime(station, hour) + Switch(station))
 Util%(station, hour)     = ActualCompletions / ImpliedTPH × 100</div>
 <p>The per-station per-day value is the mean of Util% across all active hours for that station.
 100 % means the station was producing exactly as fast as operator speed allows;
@@ -928,9 +928,9 @@ values below 100 % indicate robot-supply gaps or non-pick losses.</p>
 <h2>Constants Reference</h2>
 <table class="meth-table">
 <tr><th>Constant</th><th>Value</th><th>Used in</th></tr>
-<tr><td>Switch overhead</td><td>6 s</td><td>§1.2 Implied throughput, §2.2 Implied throughput, §7.2 Pick rate utilisation</td></tr>
+<tr><td>Switch overhead (default, configurable)</td><td>6 s</td><td>§1.2 Implied throughput, §2.2 Implied throughput, §7.2 Pick rate utilisation</td></tr>
 <tr><td>Pick time valid range</td><td>0–3 600 s</td><td>§2.1, §7.1</td></tr>
-<tr><td>Switch time valid range</td><td>0–7 200 s</td><td>§3.1, §7.1</td></tr>
+<tr><td>Operational switch / starvation</td><td>≤ 300 s / 300 s–2 h</td><td>§3.1, §7.1</td></tr>
 <tr><td>Cycle time valid range</td><td>0–7 200 s</td><td>§4.1 (disabled)</td></tr>
 <tr><td>Histogram cap</td><td>30 min</td><td>§4.1 (disabled)</td></tr>
 <tr><td>Hot-aisle multiplier</td><td>1.5 × mean</td><td>§5.2</td></tr>

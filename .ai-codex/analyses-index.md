@@ -1,6 +1,16 @@
-# Analyses Index (generated 2026-07-13)
+# Analyses Index (generated 2026-10-02)
 # Each module exports run(data, cfg) -> list[ChartResult]
 # ChartResult keys: id, title, figure, source, method, export_hint
+
+## _common.py  (47 lines)
+   analyses/_common.py — small helpers shared by several analysis modules.
+
+   Charts: (no chart IDs detected)
+
+   Functions:
+     def natural_key                (name)
+     def station_events             (lsr: pd.DataFrame, cfg: dict, amr_only: bool = True)
+     def triggergo_completions      (lsr: pd.DataFrame, cfg: dict)
 
 ## backlog.py  (225 lines)
    analyses/backlog.py — allocation wait and task backlog from the lifecycle sheet.
@@ -31,7 +41,7 @@
      def _stage_by_station          (tlc: pd.DataFrame, cfg: dict)
      def run                        (data: dict, cfg: dict)
 
-## data_quality.py  (366 lines)
+## data_quality.py  (368 lines)
    analyses/data_quality.py — data-quality panel and pick-time cross-validation.
 
    Charts:
@@ -46,7 +56,7 @@
      def _pick_crossval             (data: dict, cfg: dict)
      def run                        (data: dict, cfg: dict)
 
-## dwell_time.py  (788 lines)
+## dwell_time.py  (745 lines)
    analyses/dwell_time.py — operator pick time at workstations.
 
    Charts:
@@ -91,7 +101,7 @@
      def _littles_law               (tlc: pd.DataFrame, cfg: dict)
      def run                        (data: dict, cfg: dict)
 
-## retrieval.py  (572 lines)
+## retrieval.py  (568 lines)
    analyses/retrieval.py — where containers are fetched from in the storage grid.
 
    Charts:
@@ -142,7 +152,7 @@
    Functions:
      def run                        (data: dict, cfg: dict)
 
-## summary.py  (1206 lines)
+## summary.py  (1149 lines)
    analyses/summary.py — cross-day trend charts for the Summary tab.
 
    Charts:
@@ -157,6 +167,7 @@
 
    Functions:
      def _collect_stats             (all_days: list[dict])
+     def _hourly_completions        (day: dict)
      def _delta_heatmap             (stats: list[dict])
      def _pick_time_per_station     (stats: list[dict])
      def _avg_util_pct_trend        (stats: list[dict])
@@ -167,7 +178,7 @@
      def export_xlsx                (all_days: list[dict], outdir: str)
      def run                        (all_days: list[dict])
 
-## switch_time.py  (418 lines)
+## switch_time.py  (417 lines)
    analyses/switch_time.py — robot handoff / switch time and station starvation.
 
    Charts:
@@ -182,7 +193,7 @@
      def _starvation_heatmap        (starved: pd.DataFrame, cfg: dict, all_hours: pd.DatetimeI...)
      def run                        (data: dict, cfg: dict)
 
-## throughput.py  (806 lines)
+## throughput.py  (819 lines)
    analyses/throughput.py — completions per LABOR station per hour.
 
    Charts:

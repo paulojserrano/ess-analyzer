@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ai-codex for ESS Analyzer (Python + Tkinter + Plotly)
+ai-codex for ESS Analyzer (Python + FastAPI web UI + Plotly)
 Generates a compact codebase index for AI context injection.
 """
 
@@ -190,7 +190,8 @@ def generate_analyses_index() -> str:
 
 def generate_python_modules() -> str:
     root_py_files = [
-        'app.py', 'config.py', 'data_loader.py', 'report_builder.py'
+        'app.py', 'config.py', 'data_loader.py', 'pipeline.py', 'exports.py',
+        'report_builder.py', 'server.py', 'log_converter.py'
     ]
 
     output = [

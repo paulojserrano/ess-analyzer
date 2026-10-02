@@ -25,7 +25,15 @@ The analyser auto-detects three sheets inside each Excel workbook by their colum
 | `release` | Robot physically leaves the docking bay |
 | `ppReady` | Station signals readiness for the next robot |
 
-> **Important**: The callback sheet's `complete` event fires at robot *arrival* (same timestamp as `arrived` in the station record), **not** at pick completion. All pick-completion and throughput counts therefore use `triggerGo` from the station record.
+> **Important**: The callback sheet's `complete` event fires at robot *arrival* (same timestamp as `arrived` in the station record), **not** at pick completion. All pick-completion and throughput counts therefore use `triggerGo` from the station record — in every chart, the cross-day summary and the Excel exports (one shared definition: delivery-AMR `triggerGo` at a mapped LABOR station, `analyses/_common.py`).
+
+### Station names
+
+Station-sheet point codes (`LT_LABOR:POINT:x:y`) are mapped to station names. When the callback sheet carries an unambiguous one-to-one mapping from point code (`位置编号`) to the system's own label (`位置类型`, e.g. `LABOR-9`), those real names are used, so the station sheet, callback sheet and lifecycle `目标位置` all refer to the same physical station by the same name. Otherwise stations are numbered `LABOR-1…` in (y, x) coordinate order. Zones are one per row of stations (y coordinate).
+
+### Dating rows and the peak day
+
+Each sheet is dated row by row from its own time columns: `时间戳` for callback/station, and for lifecycle the first populated of `complete(任务完成时间)`, `放箱时间`, `取箱时间`, `分配时间`, `创建时间` (`创建时间` is often blank and is never relied on alone). When an export spans midnight, every sheet is filtered to the calendar date with the most callback rows; rows that cannot be dated are kept.
 
 ---
 
@@ -51,13 +59,13 @@ The hour is bucketed by the `triggerGo` timestamp (moment of pick completion).
 The theoretical maximum throughput a station can sustain, given how long each pick actually takes:
 
 ```
-ImpliedTPH(station, hour) = 3 600 / (AvgPickTime(station, hour) + 6)
+ImpliedTPH(station, hour) = 3 600 / (AvgPickTime(station, hour) + Switch(station))   — see §2.3
 ```
 
-- `AvgPickTime(station, hour)` — mean of all `arrived → triggerGo` durations (s) in that station-hour, bucketed by the `triggerGo` timestamp (see §2 for pick time detail)
-- `6` — fixed robot handoff overhead (seconds) added to every cycle
+- `AvgPickTime(station, hour)` — mean pick duration (s) of picks *starting* in that station-hour (see §2)
+- `Switch(station)` — robot handoff overhead: a user-set fixed value (default 6 s) or the station's measured operational switch time
 
-Because both the throughput count and the pick-time average use the `triggerGo` timestamp as the hour boundary, the numerator and denominator are perfectly aligned.
+The *Effective Tasks* view credits a pick that spans an hour boundary proportionally to each hour, so it lines up with the occupancy-based utilisation view. Effective Tasks only include completions that could be paired with a pick-start event; the chart states this coverage (normally > 95 %). The *Actual Completions* view and the Total Throughput chart count every `triggerGo`.
 
 ### 1.3 Utilisation %
 
@@ -102,7 +110,11 @@ PickTime = triggerGo.timestamp − arrived.timestamp   (seconds)
 
 Valid range: `0 < PickTime < 3 600` seconds.
 
-Events are paired per robot (`机器人编号`) in chronological order: each `arrived` event opens a pair, closed by the next `triggerGo` for the same robot. If two `arrived` events occur without an intervening `triggerGo`, the later `arrived` overwrites the earlier one.
+Events are paired per robot (`机器人编号`) in chronological order: each `arrived` event opens a pair, closed by the next `triggerGo` for the same robot. If two `arrived` events occur without an intervening `triggerGo`, the later `arrived` overwrites the earlier one. A pair whose `triggerGo` fires at a different station than the `arrived` is dropped (lost events in between), and zero-second pairs are ignored. Only the delivery AMR type is used.
+
+When an export has no `arrived` events, pick time can be measured from `ppReady` → `triggerGo` instead (station taken from the `triggerGo`). This is a slightly wider window, so absolute values run a little high; the UI asks for confirmation and the report states it.
+
+The same pairing (`dwell_time.extract_picks`) feeds every pick-based chart, the summary and the Excel exports.
 
 Bucketing uses the `arrived` timestamp so the pick-time distribution reflects when work started.
 
@@ -115,11 +127,15 @@ MedianPickTime(station, hour)  = median  { PickTime_i : station_i == station, ho
 MeanPickTime(station, hour)    = mean    { PickTime_i : station_i == station, hour_i == hour }
 ```
 
+Both statistics use each pick's full duration attributed to its start hour (never hour-sliced segments), so the heatmap, its hover and the exported rows agree.
+
 ### 2.3 Implied throughput
 
 ```
-ImpliedTPH(station, hour) = 3 600 / (MeanPickTime(station, hour) + 6)
+ImpliedTPH(station, hour) = 3 600 / (MeanPickTime(station, hour) + Switch(station))
 ```
+
+`Switch(station)` is user-configurable: a fixed value (default 6 s) for every station, or — in *measured* mode — the station's median operational switch time (§3.1), falling back to the fixed value where a station has no measured swaps.
 
 ### 2.4 Utilisation with actual switch time
 
@@ -178,7 +194,12 @@ SwitchTime = next_arrived.timestamp − release.timestamp   (seconds)
 
 Measured per station: for each `release` event at a station, the switch time is the gap to the immediately following `arrived` event at the same station, regardless of robot identity.
 
-Valid range: `0 ≤ SwitchTime < 7 200` seconds.
+Gaps are split into two regimes:
+
+- **Operational switch** — `0 ≤ gap ≤ 300 s`: a genuine robot swap while work is flowing. Only these feed switch-time statistics, measured switch times and station occupancy.
+- **Starvation** — `300 s < gap < 7 200 s`: the station sat empty (no robot dispatched, breaks). Shown in the Station Starvation chart as minutes per hour; never counted as switch time or occupancy.
+
+Gaps of 2 h or more are treated as shift boundaries and ignored.
 
 ### 3.2 Aggregation
 
@@ -187,13 +208,14 @@ MedianSwitchTime(station, hour) = median { SwitchTime_i : station_i == station, 
 MeanSwitchTime(station, hour)   = mean   { SwitchTime_i : station_i == station, hour_i == hour }
 ```
 
-Colour scale anchored to the 95th percentile of all valid values, preventing extreme outliers from compressing the colour range.
+Duration heatmaps use an ordered single-hue scale (darker = longer) spanning the 5th–95th percentile of values, so typical station-hours remain distinguishable; values outside the range saturate the colour but hover always shows the exact value.
 
 ### Charts produced
 
 | Chart ID | Description |
 |---|---|
-| `switch_heatmap` | Median (default) / average switch time per station per hour. |
+| `switch_heatmap` | Median (default) / average operational switch time per station per hour. |
+| `switch_starvation` | Minutes per hour each station had no robot (starvation episodes, hour-boundary clipped). |
 
 ---
 
@@ -396,6 +418,8 @@ TailSeverity(day) = p90_cycle_time / median_cycle_time
 
 ### 7.4 Throughput consistency (within-day)
 
+Hourly completions are delivery-AMR `triggerGo` events (the same definition as the throughput charts), counted over active hours.
+
 ```
 CV(day)          = std(hourly_completions) / mean(hourly_completions)
 PeakToMean(day)  = max(hourly_completions) / mean(hourly_completions)
@@ -435,14 +459,15 @@ R² = coefficient of determination
 
 | Symbol | Value | Used in |
 |---|---|---|
-| Switch overhead | 6 s | Throughput §1.2, Pick Time §2.3 |
+| Switch overhead (default, user-configurable) | 6 s | Throughput §1.2, Pick Time §2.3 |
+| Operational switch maximum | 300 s | Switch Time §3.1 |
 | Pick time valid range | 0–3 600 s | Pick Time §2.1, Summary §7.1 |
-| Switch time valid range | 0–7 200 s | Switch Time §3.1, Summary §7.1 |
+| Starvation episode range | 300–7 200 s | Switch Time §3.1 |
 | Cycle time valid range | 0–7 200 s | Cycle Time §4.1 |
 | Histogram cap | 30 min | Cycle Time §4.1, Summary §7.4 |
 | Hot-aisle multiplier | 1.5× mean | Retrieval §5.2 |
 | Bay heatmap colour cap | 97th percentile | Retrieval §5.3 |
-| Switch-time colour cap | 95th percentile | Switch Time §3.2 |
+| Duration heatmap colour range | 5th–95th percentile | Pick Time §2.2, Switch Time §3.2 |
 | IQR fence multiplier | 1.5× | Pick Time §2.5 |
 | Pick distribution σ | 2.5 bins (2 s each) | Pick Time §2.5 |
 | Fleet utilisation bin | 5 min | Fleet §6.2 |

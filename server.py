@@ -365,8 +365,11 @@ def create_app(output_root: str | None = None, native: bool = False) -> FastAPI:
             "native": bool(app.state.native),
         }
 
+    app.state.last_seen = 0.0
+
     @app.get("/api/state")
     def state(log_from: int = 0):
+        app.state.last_seen = time.time()
         return session.state(log_from)
 
     @app.post("/api/files")
@@ -587,9 +590,29 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _start_idle_watchdog(app: FastAPI, server, idle_s: float = 90.0) -> None:
+    """Shut the server down when no page has polled for `idle_s` seconds
+    (after the first page load) and no run is in progress."""
+    def watch() -> None:
+        while not server.should_exit:
+            time.sleep(5)
+            seen = app.state.last_seen
+            busy = app.state.session.job.status == "running"
+            if seen and not busy and time.time() - seen > idle_s:
+                server.should_exit = True
+    threading.Thread(target=watch, daemon=True, name="ess-watchdog").start()
+
+
 def launch(port: int = 0, output_root: str | None = None, mode: str = "auto") -> None:
     """Start the UI.  mode: 'auto' (native window if possible), 'browser', 'none'."""
     import uvicorn
+
+    # A windowed (no-console) PyInstaller build has no stdout/stderr; uvicorn
+    # and print() would crash writing to them.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
 
     webview = None
     if mode == "auto":
@@ -602,11 +625,15 @@ def launch(port: int = 0, output_root: str | None = None, mode: str = "auto") ->
     url = f"http://127.0.0.1:{port}/"
     app = create_app(output_root, native=webview is not None)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
-                                           log_level="warning", access_log=False))
+                                           log_level="warning", access_log=False,
+                                           log_config=None))
 
     if webview is None:
         if mode != "none":
             threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+            if getattr(sys, "frozen", False):
+                # No console window to Ctrl+C: stop once the page is closed.
+                _start_idle_watchdog(app, server)
         print(f"{APP_NAME} is running at {url}  (Ctrl+C to quit)")
         server.run()
         return
