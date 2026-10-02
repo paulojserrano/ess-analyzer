@@ -17,6 +17,15 @@ STAGE_COLORS: list[str] = [
     "#7c3aed", "#ec4899", "#0891b2", "#f97316",
 ]
 
+# ── Heatmap colour scales ────────────────────────────────────────────────────
+# Ordered single-hue sequential scale: darker always means "more" (longer time,
+# more retrievals, higher throughput).  Replaces the earlier rainbow scales,
+# whose mid-range hues (green vs yellow) had no intuitive order.
+SEQ_COLORSCALE: list[list] = [
+    [0.0, "#f4f8fd"], [0.2, "#cfe0f3"], [0.45, "#7fb0de"],
+    [0.7, "#3a7bc0"], [0.88, "#1d4f91"], [1.0, "#0c2a5b"],
+]
+
 # ── Chinese column-prefix → English stage label ──────────────────────────────
 STAGE_LABEL_MAP: dict[str, str] = {
     "分配":    "Allocation wait",

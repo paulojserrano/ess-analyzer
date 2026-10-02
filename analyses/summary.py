@@ -1134,6 +1134,11 @@ def run(all_days: list[dict]) -> list[dict]:
     if result:
         charts.append(result)
 
+    # Day labels are often dates ('2026-06-12'); force a categorical x-axis so
+    # Plotly doesn't turn them into a continuous time axis with odd ticks.
+    for c in charts:
+        c["figure"].update_xaxes(type="category")
+
     # ── Charts 4–8: disabled ──────────────────────────────────────────────────
     # result = _delta_heatmap(stats)          # Day-over-Day Change in Key Metrics
     # result = _tail_severity(stats)          # Cycle Time Tail Severity (p90 ÷ Median)

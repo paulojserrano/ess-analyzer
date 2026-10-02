@@ -364,15 +364,16 @@ def run(data: dict, cfg: dict) -> list[dict]:
             ]
             for i in range(raw.shape[0])
         ]
-        pct_dr = np.where(
-            implied_mat > 0,
-            np.where(
-                ~np.isnan(display_vals) if use_effective else raw > 0,
-                display_vals / implied_mat * 100.0,
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pct_dr = np.where(
+                implied_mat > 0,
+                np.where(
+                    ~np.isnan(display_vals) if use_effective else raw > 0,
+                    display_vals / implied_mat * 100.0,
+                    np.nan,
+                ),
                 np.nan,
-            ),
-            np.nan,
-        )
+            )
         text_pct_dr = [
             [
                 f"{pct_dr[i, j]:.0f}%" if not np.isnan(pct_dr[i, j]) else ""

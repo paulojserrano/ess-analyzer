@@ -37,6 +37,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from config import (
+    SEQ_COLORSCALE,
     AUTO_TYPE_PALETTE,
     INK,
     MAX_OPERATIONAL_SWITCH_S,
@@ -45,19 +46,9 @@ from config import (
 )
 from analyses.switch_time import resolve_switch_s
 
-# Low value = good (fast picks)
-_HEAT_COLORSCALE = [
-    [0.0, "#f0f4ff"], [0.2, "#93c5fd"],
-    [0.5, "#1d4ed8"], [0.75, "#15803d"],
-    [0.9, "#fbbf24"], [1.0, "#ef4444"],
-]
-
-# High value = good (high throughput) — reversed colour direction
-_THROUGHPUT_COLORSCALE = [
-    [0.0, "#ef4444"], [0.1, "#fbbf24"],
-    [0.25, "#15803d"], [0.5, "#1d4ed8"],
-    [0.8, "#93c5fd"], [1.0, "#f0f4ff"],
-]
+# Darker = longer pick / higher implied throughput (see config.SEQ_COLORSCALE).
+_HEAT_COLORSCALE = SEQ_COLORSCALE
+_THROUGHPUT_COLORSCALE = SEQ_COLORSCALE
 
 # Distinct per-station palette for the pick-time distribution charts — cycled by
 # each station's position in ws_order, independent of zone type, so stations
@@ -195,12 +186,19 @@ def _station_hour_heatmap_toggle(
     # Colour ranges — pick time anchored to median, throughput to average.
     # Values outside [zmin, zmax] saturate the colour scale; z itself is left
     # unclipped so hover always shows the true value.
+    # Colour range p5–p95 so typical station-hours are distinguishable; the
+    # colour bar states the range and hover shows the exact value.
     valid_s = med_s_arr[~np.isnan(med_s_arr)]
+    vmin_s  = float(np.percentile(valid_s, 5))  if valid_s.size else 0.0
     vmax_s  = float(np.percentile(valid_s, 95)) if valid_s.size else 1.0
+    if vmax_s <= vmin_s:
+        vmin_s, vmax_s = 0.0, max(vmax_s, 1.0)
 
     valid_tph = avg_tph_arr[~np.isnan(avg_tph_arr)]
     vmin_tph  = float(np.percentile(valid_tph,  5)) if valid_tph.size else 0.0
     vmax_tph  = float(np.percentile(valid_tph, 95)) if valid_tph.size else 1.0
+    if vmax_tph <= vmin_tph:
+        vmin_tph, vmax_tph = 0.0, max(vmax_tph, 1.0)
 
     fig = go.Figure()
 
@@ -210,7 +208,7 @@ def _station_hour_heatmap_toggle(
         text=med_s_text,
         x=hour_labels, y=ws_order,
         colorscale=_HEAT_COLORSCALE,
-        zmin=0, zmax=vmax_s,
+        zmin=vmin_s, zmax=vmax_s,
         texttemplate="%{text}", textfont=dict(size=8),
         hovertemplate="<b>%{y}</b><br>%{x}<br>Pick time (median): %{z:.0f} s<extra></extra>",
         colorbar=dict(title="Pick time (s)", thickness=14, len=0.8),
@@ -223,7 +221,7 @@ def _station_hour_heatmap_toggle(
         text=avg_s_text,
         x=hour_labels, y=ws_order,
         colorscale=_HEAT_COLORSCALE,
-        zmin=0, zmax=vmax_s,
+        zmin=vmin_s, zmax=vmax_s,
         texttemplate="%{text}", textfont=dict(size=8),
         hovertemplate="<b>%{y}</b><br>%{x}<br>Pick time (avg): %{z:.1f} s<extra></extra>",
         colorbar=dict(title="Pick time (s)", thickness=14, len=0.8),

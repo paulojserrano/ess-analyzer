@@ -24,13 +24,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from config import INK, MAX_OPERATIONAL_SWITCH_S, SWITCH_S_FALLBACK
+from config import INK, MAX_OPERATIONAL_SWITCH_S, SEQ_COLORSCALE, SWITCH_S_FALLBACK
 
-_HEAT_COLORSCALE = [
-    [0.0, "#f0f4ff"], [0.2, "#93c5fd"],
-    [0.5, "#1d4ed8"], [0.75, "#15803d"],
-    [0.9, "#fbbf24"], [1.0, "#ef4444"],
-]
+_HEAT_COLORSCALE = SEQ_COLORSCALE  # darker = slower swaps
 
 # 0 min starved = white, more = deeper red
 _STARVE_COLORSCALE = [
@@ -150,12 +146,15 @@ def _station_hour_heatmap_toggle(
         med_arr[~np.isnan(med_arr)],
         avg_arr[~np.isnan(avg_arr)],
     ])
+    vmin = float(np.percentile(all_valid, 5)) if all_valid.size else 0.0
     vmax = float(np.percentile(all_valid, 95)) if all_valid.size else 1.0
+    if vmax <= vmin:
+        vmin, vmax = 0.0, max(vmax, 1.0)
 
     common = dict(
         x=hour_labels, y=ws_order,
         colorscale=_HEAT_COLORSCALE,
-        zmin=0, zmax=vmax,
+        zmin=vmin, zmax=vmax,
         texttemplate="%{text}", textfont=dict(size=8),
         colorbar=dict(title="Switch time (s)", thickness=14, len=0.8),
     )
