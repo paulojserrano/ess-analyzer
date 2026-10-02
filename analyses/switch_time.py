@@ -24,13 +24,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from config import INK, MAX_OPERATIONAL_SWITCH_S, SWITCH_S_FALLBACK
+from config import INK, MAX_OPERATIONAL_SWITCH_S, SEQ_COLORSCALE, SWITCH_S_FALLBACK
 
-_HEAT_COLORSCALE = [
-    [0.0, "#f0f4ff"], [0.2, "#93c5fd"],
-    [0.5, "#1d4ed8"], [0.75, "#15803d"],
-    [0.9, "#fbbf24"], [1.0, "#ef4444"],
-]
+_HEAT_COLORSCALE = SEQ_COLORSCALE  # darker = slower swaps
 
 # 0 min starved = white, more = deeper red
 _STARVE_COLORSCALE = [
@@ -150,26 +146,29 @@ def _station_hour_heatmap_toggle(
         med_arr[~np.isnan(med_arr)],
         avg_arr[~np.isnan(avg_arr)],
     ])
+    vmin = float(np.percentile(all_valid, 5)) if all_valid.size else 0.0
     vmax = float(np.percentile(all_valid, 95)) if all_valid.size else 1.0
+    if vmax <= vmin:
+        vmin, vmax = 0.0, max(vmax, 1.0)
 
     common = dict(
         x=hour_labels, y=ws_order,
         colorscale=_HEAT_COLORSCALE,
-        zmin=0, zmax=vmax,
+        zmin=vmin, zmax=vmax,
         texttemplate="%{text}", textfont=dict(size=8),
         colorbar=dict(title="Switch time (s)", thickness=14, len=0.8),
     )
 
     fig = go.Figure()
     fig.add_trace(go.Heatmap(
-        z=np.clip(med_arr, 0, vmax).tolist(),
+        z=med_arr.tolist(),
         text=med_text,
         hovertemplate="<b>%{y}</b><br>%{x}<br>Median: %{z:.0f}s<extra></extra>",
         visible=True,
         **common,
     ))
     fig.add_trace(go.Heatmap(
-        z=np.clip(avg_arr, 0, vmax).tolist(),
+        z=avg_arr.tolist(),
         text=avg_text,
         hovertemplate="<b>%{y}</b><br>%{x}<br>Average: %{z:.0f}s<extra></extra>",
         visible=False,
@@ -190,7 +189,7 @@ def _station_hour_heatmap_toggle(
                     label="Median",
                     method="restyle",
                     args=[{
-                        "z":    [np.clip(med_arr, 0, vmax).tolist(), np.clip(avg_arr, 0, vmax).tolist()],
+                        "z":    [med_arr.tolist(), avg_arr.tolist()],
                         "text": [med_text, avg_text],
                         "visible": [True, False],
                     }, [0, 1]],
@@ -199,7 +198,7 @@ def _station_hour_heatmap_toggle(
                     label="Average",
                     method="restyle",
                     args=[{
-                        "z":    [np.clip(med_arr, 0, vmax).tolist(), np.clip(avg_arr, 0, vmax).tolist()],
+                        "z":    [med_arr.tolist(), avg_arr.tolist()],
                         "text": [med_text, avg_text],
                         "visible": [False, True],
                     }, [0, 1]],

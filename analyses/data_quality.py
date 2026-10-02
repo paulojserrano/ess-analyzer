@@ -24,6 +24,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from config import ACCENT, INK, TOTAL_DURATION_COL
+from analyses._common import triggergo_completions
 from analyses.dwell_time import extract_picks
 
 
@@ -139,21 +140,22 @@ def _dq_table(data: dict, cfg: dict) -> dict:
             "arrival and triggerGo at different stations (lost events)",
         ))
 
-        s = lsr.copy()
-        s["_st"] = s["位置编号"].map(cfg["point2ws"])
-        tgo_at_stations = int(
-            ((s["事件类型"] == "triggerGo") & s["_st"].notna()).sum()
-        )
+        # Same completion definition as the throughput charts (AMR triggerGo
+        # at a configured station).
+        tgo_at_stations = int(len(triggergo_completions(lsr, cfg)))
 
     # ── completion-count consistency across sheets ────────────────────────────
     if cb is not None and tgo_at_stations is not None:
         act_col = _find_col(cb, "动作类型")
         loc_col = _find_col(cb, "位置类型")
         if act_col and loc_col:
-            cb_completes = int((
-                (cb[act_col] == "complete")
-                & cb[loc_col].astype(str).str.startswith("LABOR")
-            ).sum())
+            is_done = (cb[act_col] == "complete") & cb[loc_col].astype(str).str.startswith("LABOR")
+            # Return (restock) tasks are not outbound picks — triggerGo never
+            # counts them, so exclude them here for a like-for-like comparison.
+            task_col = _find_col(cb, "任务编号")
+            if task_col is not None:
+                is_done &= ~cb[task_col].astype(str).str.startswith("return")
+            cb_completes = int(is_done.sum())
             if max(tgo_at_stations, cb_completes) > 0:
                 diff_pct = (
                     abs(tgo_at_stations - cb_completes)

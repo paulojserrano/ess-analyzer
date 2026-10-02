@@ -1,5 +1,7 @@
 @echo off
 cd /d "%~dp0"
+echo Installing build requirements ...
+python -m pip install -r requirements.txt pyinstaller --quiet
 echo Building ESS_Analyzer.exe ...
 pyinstaller ESS_Analyzer.spec --clean --noconfirm
 echo.

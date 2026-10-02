@@ -4,8 +4,8 @@ data_loader.py — Excel ingestion, sheet-signature detection, and runtime confi
 """
 from __future__ import annotations
 
-import io
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -23,6 +23,8 @@ from config import (
     SWITCH_S_FALLBACK,
     TOTAL_DURATION_COL,
 )
+
+_log = logging.getLogger(__name__)
 
 # ── Supported file extensions ────────────────────────────────────────────────
 _VALID_EXTENSIONS = {".xlsx", ".xlsm", ".log"}
@@ -97,6 +99,46 @@ _MIN_ROWS = 10  # sheets with fewer rows than this trigger a warning
 _MIN_PPREADY_EVENTS = 50
 
 
+# ── Per-sheet timestamp columns ──────────────────────────────────────────────
+#
+# Each sheet carries its event time in a different column.  The lifecycle
+# sheet in particular has several '…时间' columns, and the first of them
+# ('创建时间') is often completely blank — so "first column containing 时间"
+# is NOT a safe choice.  Columns are tried in preference order and coalesced
+# row by row (see row_timestamps).
+_TS_PREFERENCE: dict[str, list[str]] = {
+    "callback":   ["时间戳"],
+    "station":    ["时间戳"],
+    "lifecycle":  ["complete(任务完成时间)", "放箱时间", "取箱时间", "分配时间", "创建时间"],
+    "efficiency": ["自然小时"],
+}
+
+
+def _ts_candidates(df: pd.DataFrame, key: str) -> list[str]:
+    cols = [str(c) for c in df.columns]
+    ordered: list[str] = []
+    for needle in _TS_PREFERENCE.get(key, []):
+        ordered += [c for c in cols if needle in c and c not in ordered]
+    # Any other time-like column comes last, as a fallback.
+    ordered += [c for c in cols if ("时间" in c or "小时" in c) and c not in ordered]
+    return ordered
+
+
+def row_timestamps(df: pd.DataFrame, key: str) -> pd.Series | None:
+    """One timestamp per row: the first parseable value across the sheet's
+    preferred time columns.  Returns None when the sheet has no time column."""
+    cands = _ts_candidates(df, key)
+    if not cands:
+        return None
+    out = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    for c in cands:
+        missing = out.isna()
+        if not missing.any():
+            break
+        out[missing] = pd.to_datetime(df.loc[missing, c], errors="coerce")
+    return out
+
+
 def validate_data(data: dict[str, pd.DataFrame | None]) -> ValidationResult:
     """Validate loaded sheet data for schema conformance and quality."""
     vr = ValidationResult()
@@ -154,20 +196,20 @@ def _validate_sheet(
             f"results may not be meaningful."
         )
 
-    # Timestamp sanity: at least one parseable timestamp
-    ts_col = next((c for c in df.columns if "时间戳" in str(c) or "时间" in str(c)), None)
-    if ts_col is not None:
-        parsed = pd.to_datetime(df[ts_col], errors="coerce")
-        valid_count = parsed.notna().sum()
+    # Timestamp sanity: every row should be datable from the sheet's preferred
+    # time columns (a blank optional column such as 创建时间 is fine).
+    if len(df) and _ts_candidates(df, key):
+        parsed = row_timestamps(df, key)
+        valid_count = int(parsed.notna().sum())
         if valid_count == 0:
             vr.add_error(
-                f"'{key}' sheet column '{ts_col}' contains no parseable timestamps."
+                f"'{key}' sheet has no parseable timestamps "
+                f"(checked: {', '.join(_ts_candidates(df, key)[:4])})."
             )
         elif valid_count < len(df) * 0.5:
             bad_pct = round((1 - valid_count / len(df)) * 100)
             vr.add_warning(
-                f"'{key}' sheet: {bad_pct}% of rows in '{ts_col}' "
-                f"have unparseable timestamps."
+                f"'{key}' sheet: {bad_pct}% of rows have no parseable timestamp."
             )
 
 
@@ -409,18 +451,6 @@ def validate_user_config(cfg: dict) -> ValidationResult:
     return vr
 
 
-# ── DataFrame ↔ JSON helpers for dcc.Store ────────────────────────────────────
-
-def df_to_store(df: pd.DataFrame) -> str:
-    """Serialise a DataFrame to a JSON string suitable for dcc.Store."""
-    return df.to_json(orient="split", date_format="iso", default_handler=str)
-
-
-def df_from_store(json_str: str) -> pd.DataFrame:
-    """Deserialise a DataFrame that was stored with df_to_store."""
-    return pd.read_json(io.StringIO(json_str), orient="split")
-
-
 # ── Sheet-signature detection ─────────────────────────────────────────────────
 
 def _read_sheets(xl: pd.ExcelFile) -> dict[str, pd.DataFrame | None]:
@@ -452,7 +482,8 @@ def _read_sheets(xl: pd.ExcelFile) -> dict[str, pd.DataFrame | None]:
             elif "效率瓶颈" in cols or "自然小时" in cols:
                 data["efficiency"] = pd.read_excel(xl, sheet_name=name)
 
-        except Exception:
+        except Exception as exc:
+            _log.warning("Sheet '%s' could not be read: %s", name, exc)
             continue
 
     # Fallback by known sheet names
@@ -499,6 +530,26 @@ def load_log_day(paths: list[str]) -> dict[str, pd.DataFrame | None]:
     return convert_log_to_data(paths)
 
 
+def _open_excel(path: str) -> pd.ExcelFile:
+    """Open a workbook with the fast calamine reader when it is installed,
+    falling back to openpyxl (always available) otherwise."""
+    errors: list[str] = []
+    for engine in ("calamine", "openpyxl"):
+        try:
+            return pd.ExcelFile(path, engine=engine)
+        except ImportError as exc:
+            errors.append(f"{engine}: not installed ({exc})")
+        except Exception as exc:
+            errors.append(f"{engine}: {exc}")
+            if engine == "calamine" and "not supported" not in str(exc).lower():
+                # The file itself is unreadable; openpyxl will fail the same way.
+                continue
+    raise ValueError(
+        f"Cannot open '{os.path.basename(path)}' as an Excel file — "
+        + "; ".join(errors)
+    )
+
+
 def load_data(path: str) -> dict[str, pd.DataFrame | None]:
     """Load an xlsx or .log file from a filesystem path.
 
@@ -510,12 +561,7 @@ def load_data(path: str) -> dict[str, pd.DataFrame | None]:
         from log_converter import convert_log_to_data
         return convert_log_to_data([path])
 
-    try:
-        xl = pd.ExcelFile(path, engine="calamine")
-    except Exception as exc:
-        raise ValueError(
-            f"Cannot open '{os.path.basename(path)}' as an Excel file: {exc}"
-        ) from exc
+    xl = _open_excel(path)
 
     # Close the file handle when done — otherwise the xlsx stays locked on
     # Windows until garbage collection.
@@ -525,12 +571,6 @@ def load_data(path: str) -> dict[str, pd.DataFrame | None]:
                 f"'{os.path.basename(path)}' contains no sheets."
             )
         return _read_sheets(xl)
-
-
-def load_data_from_bytes(content_bytes: bytes) -> dict[str, pd.DataFrame | None]:
-    """Load an xlsx file from raw bytes (Dash upload callback)."""
-    xl = pd.ExcelFile(io.BytesIO(content_bytes), engine="calamine")
-    return _read_sheets(xl)
 
 
 def load_user_config(xlsx_path: str) -> tuple[dict, ValidationResult]:
@@ -567,61 +607,55 @@ def filter_to_peak_day(
     data: dict[str, pd.DataFrame | None],
 ) -> dict[str, pd.DataFrame | None]:
     """Return a copy of *data* filtered to the single calendar date with the
-    most rows in the callback sheet.  If the callback sheet already covers
-    only one date (the common case) the original dict is returned unchanged.
+    most rows in the callback sheet (station sheet when callback is absent).
+    If that sheet covers only one date (the common case) the original dict is
+    returned unchanged.
 
-    Each sheet is filtered using whichever column whose name contains '时间戳'
-    (or falls back to any column containing '时间') is found first.
+    Each sheet is dated row by row from its own preferred time columns
+    (row_timestamps) — e.g. lifecycle rows use their completion time, never the
+    often-blank 创建时间.  Rows that cannot be dated at all are kept rather than
+    silently dropped.
     """
-    cb = data.get("callback")
-    if cb is None:
+    ref_key = "callback" if data.get("callback") is not None else "station"
+    ref = data.get(ref_key)
+    if ref is None:
+        return data
+    ref_ts = row_timestamps(ref, ref_key)
+    if ref_ts is None:
+        return data
+    ref_dates = ref_ts.dt.date.dropna()
+    if ref_dates.nunique() <= 1:
         return data
 
-    ts_col = next(
-        (c for c in cb.columns if "时间戳" in str(c)),
-        next((c for c in cb.columns if "时间" in str(c)), None),
-    )
-    if ts_col is None:
-        return data
-
-    cb_dates = pd.to_datetime(cb[ts_col], errors="coerce").dt.date.dropna()
-    if cb_dates.nunique() <= 1:
-        return data
-
-    peak_date = cb_dates.value_counts().idxmax()
+    peak_date = ref_dates.value_counts().idxmax()
 
     result: dict[str, pd.DataFrame | None] = {}
     for key, df in data.items():
         if df is None:
             result[key] = None
             continue
-        # Find the best timestamp column for this sheet
-        col_k = next(
-            (c for c in df.columns if "时间戳" in str(c)),
-            next((c for c in df.columns if "时间" in str(c)), None),
-        )
-        if col_k is not None:
-            mask = pd.to_datetime(df[col_k], errors="coerce").dt.date == peak_date
-            result[key] = df[mask].reset_index(drop=True)
-        else:
+        ts = row_timestamps(df, key)
+        if ts is None:
             result[key] = df
+            continue
+        mask = (ts.dt.date == peak_date) | ts.isna()
+        result[key] = df[mask].reset_index(drop=True)
     return result
 
 
 def detect_data_date(data: dict[str, pd.DataFrame | None]) -> str | None:
-    """Return 'YYYY-MM-DD' of the earliest timestamp found in any loaded sheet."""
+    """Return 'YYYY-MM-DD' of the date most rows fall on (callback → station →
+    lifecycle), so a few pre-midnight events don't mislabel the day."""
     for key in ("callback", "station", "lifecycle"):
         df = data.get(key)
-        if df is None:
+        if df is None or df.empty:
             continue
-        for col in df.columns:
-            if "时间" in str(col):
-                try:
-                    ts = pd.to_datetime(df[col], errors="coerce").dropna()
-                    if len(ts):
-                        return ts.min().strftime("%Y-%m-%d")
-                except Exception:
-                    pass
+        ts = row_timestamps(df, key)
+        if ts is None:
+            continue
+        dates = ts.dropna().dt.date
+        if len(dates):
+            return dates.value_counts().idxmax().strftime("%Y-%m-%d")
     return None
 
 
@@ -642,9 +676,54 @@ def _parse_labor_points(lsr: pd.DataFrame) -> list[dict]:
     return rows
 
 
+def _natural_key(name: str) -> tuple:
+    """Sort 'LABOR-2' before 'LABOR-10'."""
+    return tuple(int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(name)))
+
+
+def _callback_station_names(cb: pd.DataFrame | None, points: set[str]) -> dict[str, str]:
+    """Real station names for station-sheet point codes, read from the callback
+    sheet, where each LABOR row carries both the point code (位置编号) and the
+    system's own station label (位置类型, e.g. 'LABOR-9').
+
+    Only a strict one-to-one mapping is returned: if any point maps to several
+    labels or any label to several points, {} is returned and the caller falls
+    back to coordinate-based naming (which keeps one robot per station — an
+    assumption the occupancy maths relies on).
+    """
+    if cb is None or not {"位置编号", "位置类型"} <= set(cb.columns):
+        return {}
+    sub = cb[["位置编号", "位置类型"]].dropna().astype(str)
+    sub = sub[sub["位置编号"].isin(points) & sub["位置类型"].str.startswith("LABOR")]
+    if sub.empty:
+        return {}
+    # Majority label per point tolerates the odd mis-logged row.
+    mapping = (
+        sub.groupby("位置编号")["位置类型"]
+        .agg(lambda v: v.value_counts().idxmax())
+        .to_dict()
+    )
+    if len(set(mapping.values())) != len(mapping):
+        _log.warning(
+            "Callback sheet maps several station points to the same LABOR label; "
+            "using coordinate-based station names instead."
+        )
+        return {}
+    return mapping
+
+
 def _auto_station_config(
     lsr: pd.DataFrame,
+    cb: pd.DataFrame | None = None,
 ) -> tuple[dict, list, dict, dict]:
+    """Detect LABOR stations from the station sheet's point codes.
+
+    Station names come from the callback sheet when it provides an unambiguous
+    point → 'LABOR-N' mapping, so every sheet (station, callback, lifecycle
+    目标位置) refers to the same physical station by the same name.  Otherwise
+    stations are numbered LABOR-1… in (y, x) coordinate order.  Zones are
+    always derived from the y coordinate (one zone per row of stations).
+    """
     rows = _parse_labor_points(lsr)
     if not rows:
         return {}, [], {}, {}
@@ -657,17 +736,24 @@ def _auto_station_config(
     y_vals      = sorted(df["y"].unique())
     zone_letter = {y: chr(ord("A") + i) for i, y in enumerate(y_vals)}
 
-    point2ws: dict[str, str] = {}
-    ws_order:  list[str]     = []
-    type_map:  dict[str, str] = {}
+    real = _callback_station_names(cb, set(df["point"]))
+    use_real = bool(real) and len(real) == len(df)
+    if real and not use_real:
+        # Partial coverage: only use real names if they cannot collide with the
+        # generated LABOR-<n> names for the remaining points.
+        _log.info("Callback sheet names %d of %d station points; "
+                  "using coordinate-based names.", len(real), len(df))
 
+    point2ws: dict[str, str] = {}
+    type_map: dict[str, str] = {}
     for idx, row in enumerate(df.itertuples(), start=1):
-        name = f"LABOR-{idx}"
+        name = real[row.point] if use_real else f"LABOR-{idx}"
         point2ws[row.point] = name
-        ws_order.append(name)
         type_map[name] = f"Zone {zone_letter[row.y]}"
 
-    unique_types = list(dict.fromkeys(type_map.values()))
+    ws_order = sorted(point2ws.values(), key=_natural_key) if use_real else list(point2ws.values())
+
+    unique_types = list(dict.fromkeys(type_map[w] for w in ws_order))
     type_colors  = {
         t: AUTO_TYPE_PALETTE[i % len(AUTO_TYPE_PALETTE)]
         for i, t in enumerate(unique_types)
@@ -743,7 +829,8 @@ def build_config(
 
     # Stations
     if lsr is not None:
-        point2ws, ws_order, type_map, type_colors = _auto_station_config(lsr)
+        point2ws, ws_order, type_map, type_colors = _auto_station_config(
+            lsr, data.get("callback"))
     else:
         point2ws, ws_order, type_map, type_colors = {}, [], {}, {}
 

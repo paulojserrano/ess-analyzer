@@ -28,6 +28,7 @@ from config import (
     MAX_OPERATIONAL_SWITCH_S,
     TOTAL_DURATION_COL,
 )
+from analyses._common import natural_key, triggergo_completions
 from analyses.dwell_time import extract_picks
 from analyses.switch_time import _release_arrived_gaps, resolve_switch_s
 
@@ -53,17 +54,8 @@ def _collect_stats(all_days: list[dict]) -> list[dict]:
         # throughput analysis.  triggerGo fires when the operator finishes
         # picking and releases the robot (the true task-completion signal).
         total_tasks: int | None = None
-        if lsr is not None:
-            point2ws = day.get("cfg", {}).get("point2ws", {})
-            evt_col  = next((c for c in lsr.columns if "事件类型" in str(c)), None)
-            loc_col  = next((c for c in lsr.columns if "位置编号" in str(c)), None)
-            if evt_col and loc_col:
-                lsr_s = lsr.copy()
-                lsr_s["_station"] = lsr_s[loc_col].map(point2ws) if point2ws else None
-                tgo = lsr_s[lsr_s[evt_col] == "triggerGo"]
-                if point2ws:
-                    tgo = tgo[tgo["_station"].notna()]
-                total_tasks = int(len(tgo))
+        if lsr is not None and day.get("cfg", {}).get("point2ws"):
+            total_tasks = int(len(triggergo_completions(lsr, day["cfg"])))
 
         # ── median + p90 cycle time (minutes) ─────────────────────────────────
         med_cycle_min: float | None = None
@@ -132,6 +124,19 @@ def _collect_stats(all_days: list[dict]) -> list[dict]:
             "med_switch_s":            med_switch_s,
         })
     return rows
+
+
+def _hourly_completions(day: dict) -> pd.Series | None:
+    """Completions per active hour for one day — AMR triggerGo at configured
+    stations, the same definition as the throughput charts."""
+    lsr = day["data"].get("station")
+    cfg = day.get("cfg", {})
+    if lsr is None or not cfg.get("point2ws"):
+        return None
+    tgo = triggergo_completions(lsr, cfg)
+    if tgo.empty:
+        return None
+    return tgo.groupby(tgo["ts"].dt.floor("h")).size()
 
 
 # ── chart builders ────────────────────────────────────────────────────────────
@@ -262,7 +267,7 @@ def _pick_time_per_station(stats: list[dict]) -> dict | None:
     for r in stats:
         for ws in r.get("avg_pick_by_station", {}).keys():
             seen[ws] = None
-    all_stations = sorted(seen.keys())
+    all_stations = sorted(seen.keys(), key=natural_key)
 
     fig = go.Figure()
 
@@ -362,7 +367,7 @@ def _avg_util_pct_trend(stats: list[dict]) -> dict | None:
     for r in stats:
         for ws in r.get("avg_util_pct_by_station", {}).keys():
             seen[ws] = None
-    all_stations = sorted(seen.keys())
+    all_stations = sorted(seen.keys(), key=natural_key)
 
     if not all_stations:
         return None
@@ -543,25 +548,11 @@ def _throughput_consistency(all_days: list[dict]) -> dict | None:
 
     for day in all_days:
         labels.append(day["label"])
-        cb = day["data"].get("callback")
-        if cb is None:
+        hourly = _hourly_completions(day)
+        if hourly is None:
             cvs.append(None)
             peak_means.append(None)
             continue
-
-        act_col = next((c for c in cb.columns if "动作类型" in str(c)), None)
-        loc_col = next((c for c in cb.columns if "位置类型" in str(c)), None)
-        ts_col  = next((c for c in cb.columns if "时间戳"   in str(c)), None)
-
-        if not (act_col and loc_col and ts_col):
-            cvs.append(None)
-            peak_means.append(None)
-            continue
-
-        lab = cb[cb[loc_col].astype(str).str.startswith("LABOR")].copy()
-        lab = lab[lab[act_col] == "complete"]
-        lab["_hour"] = pd.to_datetime(lab[ts_col], errors="coerce").dt.floor("h")
-        hourly = lab.groupby("_hour").size()
 
         if len(hourly) < 2:
             cvs.append(None)
@@ -722,87 +713,42 @@ def _pick_r2_trend(all_days: list[dict]) -> dict | None:
     for day in all_days:
         label = day["label"]
         lsr   = day["data"].get("station")
-        cb    = day["data"].get("callback")
         cfg   = day.get("cfg", {})
 
         day_labels.append(label)
 
-        if lsr is None or cb is None or not cfg.get("point2ws") or not cfg.get("ws_order"):
+        if lsr is None or not cfg.get("point2ws") or not cfg.get("ws_order"):
             r2_vals.append(None)
             slope_vals.append(None)
             n_obs_vals.append(None)
             continue
 
         ws_order = cfg["ws_order"]
-        point2ws = cfg["point2ws"]
 
         # ── pick times per station×hour ──────────────────────────────────────
-        lsr_c = lsr.copy()
-        lsr_c["ts"]      = pd.to_datetime(lsr_c["时间戳"], errors="coerce")
-        lsr_c["station"] = lsr_c["位置编号"].map(point2ws)
-
-        amr_type = cfg.get("amr_type")
-        if amr_type and "机器人类型" in lsr_c.columns:
-            lsr_c = lsr_c[lsr_c["机器人类型"] == amr_type]
-
-        ev = lsr_c.sort_values(["机器人编号", "ts"])
-        pick_rows: list[dict] = []
-        for _rb, sub in ev.groupby("机器人编号"):
-            arr = arr_loc = None
-            for ts, et, loc in sub[["ts", "事件类型", "station"]].values:
-                if et == "arrived":
-                    arr, arr_loc = ts, loc
-                elif et == "triggerGo" and arr is not None:
-                    pick_rows.append({
-                        "station": arr_loc,
-                        "hour_dt": arr.floor("h"),
-                        "pick_s":  (ts - arr).total_seconds(),
-                    })
-                    arr = None
-
-        if not pick_rows:
+        # Shared pairing (station-match guard, zero-second picks dropped,
+        # ppReady fallback honoured) — identical to the day-level charts.
+        pick_df = extract_picks(lsr, cfg)
+        if pick_df.empty:
             r2_vals.append(None)
             slope_vals.append(None)
             n_obs_vals.append(None)
             continue
 
-        pick_df = pd.DataFrame(pick_rows).dropna(subset=["station"])
-        pick_df = pick_df[(pick_df["pick_s"] >= 0) & (pick_df["pick_s"] < 3600)]
         pivot_avg_s = (
             pick_df.groupby(["station", "hour_dt"])["pick_s"]
             .mean()
             .unstack()
         )
-        if pivot_avg_s.empty:
-            r2_vals.append(None)
-            slope_vals.append(None)
-            n_obs_vals.append(None)
-            continue
-
         day_ref   = pivot_avg_s.columns.min().normalize()
         all_hours = pd.date_range(day_ref, periods=24, freq="h")
         pivot_avg_s = pivot_avg_s.reindex(columns=all_hours)
 
-        # ── actual completions per station×hour ──────────────────────────────
-        loc_col = next((c for c in cb.columns if "位置类型" in str(c)), None)
-        act_col = next((c for c in cb.columns if "动作类型" in str(c)), None)
-        ts_col  = next((c for c in cb.columns if "时间戳"   in str(c)), None)
-
-        if not (loc_col and act_col and ts_col):
-            r2_vals.append(None)
-            slope_vals.append(None)
-            n_obs_vals.append(None)
-            continue
-
-        lab = cb[cb[loc_col].astype(str).str.startswith("LABOR")].copy()
-        lab["ts"]      = pd.to_datetime(lab[ts_col], errors="coerce")
-        lab["hour"]    = lab["ts"].dt.floor("h")
-        lab            = lab[lab[act_col] == "complete"]
-        lab["station"] = lab[loc_col].map(
-            lambda v: v if v in ws_order else point2ws.get(v, v)
-        )
+        # ── actual completions per station×hour (triggerGo, as throughput) ──
+        tgo = triggergo_completions(lsr, cfg)
         actual_pivot = (
-            lab.groupby(["hour", "station"])
+            tgo.assign(hour=tgo["ts"].dt.floor("h"))
+               .groupby(["hour", "station"])
                .size()
                .unstack(fill_value=0)
                .reindex(index=all_hours, columns=ws_order, fill_value=0)
@@ -961,7 +907,7 @@ def _pick_r2_trend(all_days: list[dict]) -> dict | None:
         "id":          "summary_pick_r2_trend",
         "title":       "How Much Does Pick Time Explain Throughput? (R² per Day)",
         "figure":      fig,
-        "source":      "All days — station record + callback sheets",
+        "source":      "All days — station record sheet",
         "method":      (
             "For each day, a linear regression (OLS) is fitted to station-hour observations "
             "where X = average operator pick time (s) and Y = actual completions/hr. "
@@ -996,7 +942,7 @@ def export_xlsx(all_days: list[dict], outdir: str) -> None:
     df_daily = pd.DataFrame(daily_rows).set_index("Day")
 
     # ── Sheet 2: avg pick time by station ─────────────────────────────────────
-    all_stations = sorted({ws for r in stats for ws in r.get("avg_pick_by_station", {})})
+    all_stations = sorted({ws for r in stats for ws in r.get("avg_pick_by_station", {})}, key=natural_key)
     pick_rows = []
     for r in stats:
         row: dict = {"Day": r["label"]}
@@ -1039,23 +985,14 @@ def export_xlsx(all_days: list[dict], outdir: str) -> None:
     # ── Sheet 5: throughput consistency ──────────────────────────────────────
     consist_rows = []
     for day in all_days:
-        cb    = day["data"].get("callback")
         label = day["label"]
         cv    = peak_mean = None
-        if cb is not None:
-            act_col = next((c for c in cb.columns if "动作类型" in str(c)), None)
-            loc_col = next((c for c in cb.columns if "位置类型" in str(c)), None)
-            ts_col  = next((c for c in cb.columns if "时间戳"   in str(c)), None)
-            if act_col and loc_col and ts_col:
-                lab = cb[cb[loc_col].astype(str).str.startswith("LABOR")].copy()
-                lab = lab[lab[act_col] == "complete"]
-                lab["_h"] = pd.to_datetime(lab[ts_col], errors="coerce").dt.floor("h")
-                hourly = lab.groupby("_h").size()
-                if len(hourly) >= 2:
-                    mu = float(hourly.mean())
-                    if mu > 0:
-                        cv        = round(float(hourly.std() / mu), 3)
-                        peak_mean = round(float(hourly.max() / mu), 3)
+        hourly = _hourly_completions(day)
+        if hourly is not None and len(hourly) >= 2:
+            mu = float(hourly.mean())
+            if mu > 0:
+                cv        = round(float(hourly.std() / mu), 3)
+                peak_mean = round(float(hourly.max() / mu), 3)
         consist_rows.append({"Day": label, "CV (σ / mean)": cv, "Peak / Mean Ratio": peak_mean})
     df_consist = pd.DataFrame(consist_rows).set_index("Day")
 
@@ -1195,6 +1132,11 @@ def run(all_days: list[dict]) -> list[dict]:
     result = _avg_util_pct_trend(stats)
     if result:
         charts.append(result)
+
+    # Day labels are often dates ('2026-06-12'); force a categorical x-axis so
+    # Plotly doesn't turn them into a continuous time axis with odd ticks.
+    for c in charts:
+        c["figure"].update_xaxes(type="category")
 
     # ── Charts 4–8: disabled ──────────────────────────────────────────────────
     # result = _delta_heatmap(stats)          # Day-over-Day Change in Key Metrics

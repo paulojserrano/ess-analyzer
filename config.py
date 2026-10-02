@@ -17,6 +17,15 @@ STAGE_COLORS: list[str] = [
     "#7c3aed", "#ec4899", "#0891b2", "#f97316",
 ]
 
+# ── Heatmap colour scales ────────────────────────────────────────────────────
+# Ordered single-hue sequential scale: darker always means "more" (longer time,
+# more retrievals, higher throughput).  Replaces the earlier rainbow scales,
+# whose mid-range hues (green vs yellow) had no intuitive order.
+SEQ_COLORSCALE: list[list] = [
+    [0.0, "#f4f8fd"], [0.2, "#cfe0f3"], [0.45, "#7fb0de"],
+    [0.7, "#3a7bc0"], [0.88, "#1d4f91"], [1.0, "#0c2a5b"],
+]
+
 # ── Chinese column-prefix → English stage label ──────────────────────────────
 STAGE_LABEL_MAP: dict[str, str] = {
     "分配":    "Allocation wait",
@@ -66,6 +75,37 @@ ANALYSIS_MODULES: list[tuple[str, str]] = [
     ("returns",    "Outbound vs return flow"),
     ("efficiency", "HPS3 bottleneck attribution  (efficiency sheet)"),
     ("quality",    "Data quality & cross-validation"),
+]
+
+# Implementing module for each registry key — the pipeline imports these with
+# importlib (see pipeline.py); nothing else imports analysis modules directly.
+ANALYSIS_IMPLEMENTATIONS: dict[str, str] = {
+    "throughput": "analyses.throughput",
+    "dwell":      "analyses.dwell_time",
+    "switch":     "analyses.switch_time",
+    "readiness":  "analyses.station_readiness",
+    "cycle":      "analyses.cycle_time",
+    "backlog":    "analyses.backlog",
+    "retrieval":  "analyses.retrieval",
+    "fleet":      "analyses.fleet_utilization",
+    "robot":      "analyses.robot_performance",
+    "returns":    "analyses.return_flow",
+    "efficiency": "analyses.efficiency",
+    "quality":    "analyses.data_quality",
+}
+
+# Analyses that need the lifecycle sheet and are skipped without it.
+LIFECYCLE_ONLY: set[str] = {"cycle", "retrieval", "backlog"}
+
+# Preferred chart order inside a day's report.  Listed IDs come first in this
+# order; all others follow in pipeline order.
+CHART_DISPLAY_ORDER: list[str] = [
+    "throughput_total",
+    "throughput_heatmap",
+    "dwell_heatmap",
+    "switch_heatmap",
+    "dwell_pick_distribution",
+    "throughput_picker_rate",
 ]
 
 # Analyses checked by default in the GUI

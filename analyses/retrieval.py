@@ -17,14 +17,10 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from config import ACCENT, INK
+from config import ACCENT, INK, SEQ_COLORSCALE
 from analyses.fleet_utilization import _delivery_leg_col
 
-_HEAT_COLORSCALE = [
-    [0.0, "#f0f4ff"], [0.2, "#93c5fd"],
-    [0.5, "#1d4ed8"], [0.75, "#15803d"],
-    [0.9, "#fbbf24"], [1.0, "#ef4444"],
-]
+_HEAT_COLORSCALE = SEQ_COLORSCALE  # darker = more retrievals
 
 
 def _parse_source(tlc: pd.DataFrame) -> tuple[pd.DataFrame | None, str | None, str | None, str | None]:
@@ -149,7 +145,7 @@ def _bay_heatmap(src: pd.DataFrame) -> dict:
     _bay_rows = [
         {"aisle": str(aisles[_ai]), "bay": int(_b), "retrievals": int(gv[_ai, _bi])}
         for _ai in range(len(aisles))
-        for _bi, _b in enumerate(range(1, max_bay + 1))
+        for _bi, _b in enumerate(bays)
         if gv[_ai, _bi] > 0
     ]
 

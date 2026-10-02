@@ -476,7 +476,7 @@ def run(data: dict, cfg: dict) -> list[dict]:
         return []
 
     tlc = tlc.copy()
-    tlc["complete_ts"] = pd.to_datetime(tlc["complete(任务完成时间)"])
+    tlc["complete_ts"] = pd.to_datetime(tlc["complete(任务完成时间)"], errors="coerce")
     tlc["hour"]        = tlc["complete_ts"].dt.floor("h")
 
     dest_col = next((c for c in tlc.columns if "目标位置" in str(c)), None)

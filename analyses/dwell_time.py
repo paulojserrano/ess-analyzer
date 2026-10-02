@@ -37,6 +37,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from config import (
+    SEQ_COLORSCALE,
     AUTO_TYPE_PALETTE,
     INK,
     MAX_OPERATIONAL_SWITCH_S,
@@ -45,19 +46,9 @@ from config import (
 )
 from analyses.switch_time import resolve_switch_s
 
-# Low value = good (fast picks)
-_HEAT_COLORSCALE = [
-    [0.0, "#f0f4ff"], [0.2, "#93c5fd"],
-    [0.5, "#1d4ed8"], [0.75, "#15803d"],
-    [0.9, "#fbbf24"], [1.0, "#ef4444"],
-]
-
-# High value = good (high throughput) — reversed colour direction
-_THROUGHPUT_COLORSCALE = [
-    [0.0, "#ef4444"], [0.1, "#fbbf24"],
-    [0.25, "#15803d"], [0.5, "#1d4ed8"],
-    [0.8, "#93c5fd"], [1.0, "#f0f4ff"],
-]
+# Darker = longer pick / higher implied throughput (see config.SEQ_COLORSCALE).
+_HEAT_COLORSCALE = SEQ_COLORSCALE
+_THROUGHPUT_COLORSCALE = SEQ_COLORSCALE
 
 # Distinct per-station palette for the pick-time distribution charts — cycled by
 # each station's position in ws_order, independent of zone type, so stations
@@ -192,23 +183,32 @@ def _station_hour_heatmap_toggle(
     avg_s_arr,   avg_s_text   = _prep_heatmap_arrays(pivot_avg_s,   ws_order, "{:.1f}s")
     avg_tph_arr, avg_tph_text = _prep_heatmap_arrays(pivot_avg_tph, ws_order, "{:.0f}/hr")
 
-    # Colour ranges — pick time anchored to median, throughput to average
+    # Colour ranges — pick time anchored to median, throughput to average.
+    # Values outside [zmin, zmax] saturate the colour scale; z itself is left
+    # unclipped so hover always shows the true value.
+    # Colour range p5–p95 so typical station-hours are distinguishable; the
+    # colour bar states the range and hover shows the exact value.
     valid_s = med_s_arr[~np.isnan(med_s_arr)]
+    vmin_s  = float(np.percentile(valid_s, 5))  if valid_s.size else 0.0
     vmax_s  = float(np.percentile(valid_s, 95)) if valid_s.size else 1.0
+    if vmax_s <= vmin_s:
+        vmin_s, vmax_s = 0.0, max(vmax_s, 1.0)
 
     valid_tph = avg_tph_arr[~np.isnan(avg_tph_arr)]
     vmin_tph  = float(np.percentile(valid_tph,  5)) if valid_tph.size else 0.0
     vmax_tph  = float(np.percentile(valid_tph, 95)) if valid_tph.size else 1.0
+    if vmax_tph <= vmin_tph:
+        vmin_tph, vmax_tph = 0.0, max(vmax_tph, 1.0)
 
     fig = go.Figure()
 
     # ── Trace 0 : Pick Time — Median (default) ───────────────────────────────
     fig.add_trace(go.Heatmap(
-        z=np.clip(med_s_arr, 0, vmax_s).tolist(),
+        z=med_s_arr.tolist(),
         text=med_s_text,
         x=hour_labels, y=ws_order,
         colorscale=_HEAT_COLORSCALE,
-        zmin=0, zmax=vmax_s,
+        zmin=vmin_s, zmax=vmax_s,
         texttemplate="%{text}", textfont=dict(size=8),
         hovertemplate="<b>%{y}</b><br>%{x}<br>Pick time (median): %{z:.0f} s<extra></extra>",
         colorbar=dict(title="Pick time (s)", thickness=14, len=0.8),
@@ -217,11 +217,11 @@ def _station_hour_heatmap_toggle(
 
     # ── Trace 1 : Pick Time — Average ────────────────────────────────────────
     fig.add_trace(go.Heatmap(
-        z=np.clip(avg_s_arr, 0, vmax_s).tolist(),
+        z=avg_s_arr.tolist(),
         text=avg_s_text,
         x=hour_labels, y=ws_order,
         colorscale=_HEAT_COLORSCALE,
-        zmin=0, zmax=vmax_s,
+        zmin=vmin_s, zmax=vmax_s,
         texttemplate="%{text}", textfont=dict(size=8),
         hovertemplate="<b>%{y}</b><br>%{x}<br>Pick time (avg): %{z:.1f} s<extra></extra>",
         colorbar=dict(title="Pick time (s)", thickness=14, len=0.8),
@@ -230,7 +230,7 @@ def _station_hour_heatmap_toggle(
 
     # ── Trace 2 : Implied Throughput — Average ────────────────────────────────
     fig.add_trace(go.Heatmap(
-        z=np.clip(avg_tph_arr, vmin_tph, vmax_tph).tolist(),
+        z=avg_tph_arr.tolist(),
         text=avg_tph_text,
         x=hour_labels, y=ws_order,
         colorscale=_THROUGHPUT_COLORSCALE,
@@ -592,57 +592,14 @@ def run(data: dict, cfg: dict) -> list[dict]:
         all_hours = pd.date_range(day, periods=24, freq="h")
         pivot_med_s = pivot_med_s.reindex(columns=all_hours)
 
-    # ── Weighted avg pick time for implied throughput ──────────────────────────
-    # Each task contributes its full duration, weighted by the fraction of the
-    # task attributed to that hour (matching the proportional task-count logic
-    # in throughput.py).  This ensures implied_capacity × fraction ≈ eff_tasks.
-    # Vast majority of picks land entirely within one hour — handle those with a
-    # vectorised assignment, and only loop row-by-row for the rare boundary-spanning
-    # picks (which may cross more than one hour boundary for very long picks).
-    _hour_td2  = pd.Timedelta(hours=1)
-    _arr_hr    = d["arr_ts"].dt.floor("h")
-    _tg_hr     = d["tg_ts"].dt.floor("h")
-    _pos_mask  = d["pick_s"] > 0
-    _same_mask = _pos_mask & (_arr_hr == _tg_hr)
-    _cross_mask = _pos_mask & ~_same_mask
+    # Mean pick time per station × start hour — the same full-duration,
+    # start-hour attribution as the median (and as the exported raw rows), so
+    # the heatmap, its hover and the raw data always agree.
+    pivot_wavg_s = grp.mean().unstack()
+    if all_hours is not None:
+        pivot_wavg_s = pivot_wavg_s.reindex(columns=all_hours)
 
-    _w_frames: list[pd.DataFrame] = []
-    if _same_mask.any():
-        _w_frames.append(pd.DataFrame({
-            "station":  d.loc[_same_mask, "station"].values,
-            "hour_dt":  _arr_hr[_same_mask].values,
-            "full_dur": d.loc[_same_mask, "pick_s"].values,
-            "frac":     1.0,
-        }))
-
-    if _cross_mask.any():
-        _cross_rows: list[dict] = []
-        for r in d.loc[_cross_mask, ["station", "arr_ts", "tg_ts", "pick_s"]].itertuples(index=False):
-            arr_hr = r.arr_ts.floor("h")
-            tg_hr  = r.tg_ts.floor("h")
-            h = arr_hr
-            while h <= tg_hr:
-                seg = (min(r.tg_ts, h + _hour_td2) - max(r.arr_ts, h)).total_seconds()
-                if seg > 0:
-                    _cross_rows.append({"station": r.station, "hour_dt": h,
-                                        "full_dur": r.pick_s, "frac": seg / r.pick_s})
-                h += _hour_td2
-        if _cross_rows:
-            _w_frames.append(pd.DataFrame(_cross_rows))
-
-    if _w_frames:
-        _wdf = pd.concat(_w_frames, ignore_index=True)
-        _wdf["w_dur"] = _wdf["frac"] * _wdf["full_dur"]
-        _wg = _wdf.groupby(["station", "hour_dt"])
-        pivot_wavg_s = (_wg["w_dur"].sum() / _wg["frac"].sum()).unstack()
-        if all_hours is not None:
-            pivot_wavg_s = pivot_wavg_s.reindex(columns=all_hours)
-    else:
-        pivot_wavg_s = grp.mean().unstack()
-        if all_hours is not None:
-            pivot_wavg_s = pivot_wavg_s.reindex(columns=all_hours)
-
-    # ── Implied throughput = 3600 / (weighted avg pick + switch time) ──────────
+    # ── Implied throughput = 3600 / (mean pick + switch time) ──────────────────
     # The switch term is user-configurable (see resolve_switch_s): either the
     # flat, user-set value or the per-station measured operational switch time.
     _sw_series = pd.Series(

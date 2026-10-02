@@ -23,6 +23,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from config import ACCENT, INK, MAX_OPERATIONAL_SWITCH_S
+from analyses._common import station_events, triggergo_completions
 from analyses.switch_time import resolve_switch_s
 
 _log = logging.getLogger(__name__)
@@ -61,16 +62,12 @@ def run(data: dict, cfg: dict) -> list[dict]:
     design_total = cfg["design_total_rate"]
 
     # Prepare station-record rows once — used for both throughput count and pick time
-    lsr_t = lsr.copy()
-    lsr_t["ts"]      = pd.to_datetime(lsr_t["时间戳"])
-    lsr_t["station"] = lsr_t["位置编号"].map(cfg["point2ws"])
-    amr_type = cfg.get("amr_type")
-    if amr_type and "机器人类型" in lsr_t.columns:
-        lsr_t = lsr_t[lsr_t["机器人类型"] == amr_type]
+    # Unparseable timestamps are dropped rather than crashing the module.
+    lsr_t = station_events(lsr, cfg)
 
-    # Throughput = triggerGo events: operator done, robot leaves (true task completion)
-    tgo = lsr_t[lsr_t["事件类型"] == "triggerGo"].dropna(subset=["station"])
-    tgo = tgo[tgo["station"].isin(ws_order)]
+    # Throughput = triggerGo events: operator done, robot leaves (true task
+    # completion).  Shared definition — see analyses/_common.py.
+    tgo = triggergo_completions(lsr, cfg).copy()
     tgo["hour"] = tgo["ts"].dt.floor("h")
 
     pivot = tgo.groupby(["hour", "station"]).size().unstack(fill_value=0)
@@ -224,6 +221,13 @@ def run(data: dict, cfg: dict) -> list[dict]:
                 "falling back to raw counts (%s: %s)", type(exc).__name__, exc,
             )
 
+    # Effective Tasks are built from paired pick events, so they can only total
+    # as many completions as could be paired.  Report that coverage so the
+    # heatmap total is never silently compared with the triggerGo bar chart.
+    pair_coverage: float | None = None
+    if effective_tasks_2d is not None and raw.sum() > 0:
+        pair_coverage = float(np.nansum(effective_tasks_2d) / raw.sum() * 100.0)
+
     nonzero_totals = totals[totals > 0]
     avg_tp  = float(nonzero_totals.mean()) if len(nonzero_totals) else 0.0
     peak_tp = float(totals.max()) if len(totals) else 0.0
@@ -251,7 +255,7 @@ def run(data: dict, cfg: dict) -> list[dict]:
         )
     fig1.add_hline(
         y=avg_tp, line_dash="dot", line_color="#888888", line_width=1.5,
-        annotation_text=f"Avg  {avg_tp:,.0f} /hr",
+        annotation_text=f"Avg (active hours)  {avg_tp:,.0f} /hr",
         annotation_position="bottom right",
         annotation_font=dict(color="#666666", size=11),
     )
@@ -360,15 +364,16 @@ def run(data: dict, cfg: dict) -> list[dict]:
             ]
             for i in range(raw.shape[0])
         ]
-        pct_dr = np.where(
-            implied_mat > 0,
-            np.where(
-                ~np.isnan(display_vals) if use_effective else raw > 0,
-                display_vals / implied_mat * 100.0,
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pct_dr = np.where(
+                implied_mat > 0,
+                np.where(
+                    ~np.isnan(display_vals) if use_effective else raw > 0,
+                    display_vals / implied_mat * 100.0,
+                    np.nan,
+                ),
                 np.nan,
-            ),
-            np.nan,
-        )
+            )
         text_pct_dr = [
             [
                 f"{pct_dr[i, j]:.0f}%" if not np.isnan(pct_dr[i, j]) else ""
@@ -609,6 +614,13 @@ def run(data: dict, cfg: dict) -> list[dict]:
                 "NO proportional weighting — each completion is credited whole to the hour its "
                 "triggerGo fired in, so a station-hour's value is a simple integer count. "
                 "Dark cells are high-throughput station-hours; pale cells are low-activity periods."
+                + (
+                    f" Coverage: Effective Tasks account for {pair_coverage:.1f}% of the day's "
+                    "triggerGo completions — the remainder could not be paired with a pick-start "
+                    "event (lost events) and appear only in the Actual Completions view and the "
+                    "Total Throughput chart."
+                    if pair_coverage is not None else ""
+                )
             )
             if use_effective else
             (
@@ -631,6 +643,7 @@ def run(data: dict, cfg: dict) -> list[dict]:
         "export_hint": "throughput_by_workstation_hour.xlsx",
         "raw_data": {
             "description": "Effective tasks per station per hour (with active time % and raw completions)" if use_effective else "Completions per station per hour (and active time % where available)",
+            "effective_task_coverage_pct": None if pair_coverage is None else round(pair_coverage, 1),
             "rows": _heatmap_rows,
         },
     })
