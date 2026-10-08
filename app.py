@@ -1,24 +1,12 @@
 """
-app.py — ESS / ASRS Log Analyzer entry point.
+app.py — ESS station & robot cycle analyser.
 
-    python app.py                         open the desktop UI
-    python app.py day1.xlsx day2.xlsx     analyse files headless (CLI)
-    python app.py --help                  all options
+    python app.py                       open the UI
+    python app.py LOG [LOG ...]         analyse those logs and write the reports
+    python app.py all_logs/             analyse every log in a folder
 
-The UI is a local web app (server.py + webui/) shown in a native window when
-pywebview is installed, otherwise in the default browser.  The CLI and the UI
-share one pipeline (pipeline.py), so they produce identical reports.
-
-Architecture
-------------
-  config.py          — constants, colour palettes, analysis registry
-  data_loader.py     — Excel / log ingestion, sheet detection, build_config()
-  analyses/          — one module per domain; each exposes run(data, cfg)
-  pipeline.py        — load → analyse → export → report orchestration
-  exports.py         — Excel workbooks written alongside the report
-  report_builder.py  — self-contained HTML report
-  server.py, webui/  — desktop UI
-  app.py             — command-line entry point (this file)
+Inputs are Hairobotics "play_extract" application logs, plain (.log) or gzipped
+(.log.gz).  Files sharing a date in their name are treated as one day.
 """
 from __future__ import annotations
 
@@ -27,102 +15,121 @@ import logging
 import os
 import sys
 
-from config import ANALYSIS_MODULES, PICK_START_EVENTS, SWITCH_S_FALLBACK
+from config import DOOR_S_DEFAULT, STARVED_S_DEFAULT, TARGET_RATE_DEFAULT, Settings, load_settings
+from pipeline import find_logs, run
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    keys = [k for k, _ in ANALYSIS_MODULES]
     ap = argparse.ArgumentParser(
-        prog="ESS_Analyzer",
-        description="Analyse Hairobotics ESS/ASRS exports. With no files, opens the UI.",
+        prog="ess-analyzer",
+        description="Station and robot cycle analysis from Hairobotics logs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="With no files, the desktop UI opens instead.",
     )
-    ap.add_argument("files", nargs="*", help=".xlsx/.xlsm/.log files (one Excel file per day; "
-                                             "split .log files of one day are merged)")
-    ap.add_argument("--out", help="output folder (default: asrs_analysis_output next to the app)")
-    ap.add_argument("--analyses", help=f"comma-separated subset of: {', '.join(keys)}")
-    ap.add_argument("--switch-mode", choices=["fixed", "measured"], default="fixed",
-                    help="robot switch-time model for implied throughput (default: fixed)")
-    ap.add_argument("--switch-s", type=float, default=SWITCH_S_FALLBACK,
-                    help=f"fixed switch time in seconds (default {SWITCH_S_FALLBACK:g})")
-    ap.add_argument("--pick-start", choices=list(PICK_START_EVENTS),
-                    help="pick-time start event (default: automatic)")
-    ap.add_argument("--no-excel", action="store_true", help="skip the Excel exports")
-    ui = ap.add_argument_group("UI")
-    ui.add_argument("--port", type=int, default=0, help="UI port (default: any free port)")
-    ui.add_argument("--browser", action="store_true",
-                    help="open the UI in the web browser instead of a native window")
-    ui.add_argument("--no-open", action="store_true", help="start the UI server only")
-    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("logs", nargs="*", metavar="LOG",
+                    help=".log or .log.gz files, or folders containing them")
+    ap.add_argument("--door", type=float, default=None, metavar="S",
+                    help=f"seconds of shutter-door travel added to every switch time "
+                         f"(default {DOOR_S_DEFAULT:g}); the same seconds come off the front "
+                         f"of each pick, so the hour budget still adds up")
+    ap.add_argument("--no-door", default=None, metavar="LIST",
+                    help='comma-separated stations or zones without a shutter door, e.g. '
+                         '"LABOR-8,Zone B" (every station has one by default)')
+    ap.add_argument("--no-door-days", default=None, metavar="DATES",
+                    help='comma-separated dates when the doors were not in use, e.g. '
+                         '"2026-09-25,2026-09-26" (no door seconds on those days)')
+    ap.add_argument("--starved", type=float, default=None, metavar="S",
+                    help=f"seconds a station waits beyond its median handover before it counts "
+                         f"as starved for a robot (default {STARVED_S_DEFAULT:g})")
+    ap.add_argument("--target", type=float, default=None, metavar="RATE",
+                    help=f"target totes per hour for the high-rate zone(s) "
+                         f"(default {TARGET_RATE_DEFAULT:g}); per-station or per-zone targets go "
+                         f"in ess_config.json, and every target can be changed in the report")
+    ap.add_argument("--out", default=None, metavar="DIR",
+                    help="output folder (default: asrs_analysis_output next to the app)")
+    ap.add_argument("--open", action="store_true", help="open the report when it is written")
+    ap.add_argument("--quiet", action="store_true", help="only print the final paths")
+    # UI options
+    ap.add_argument("--browser", action="store_true",
+                    help="open the UI in the default browser instead of a window")
+    ap.add_argument("--port", type=int, default=0, help="port for the UI (default: automatic)")
     return ap.parse_args(argv)
 
 
-def run_headless(args: argparse.Namespace) -> int:
-    from pipeline import LoadError, RunSettings, group_input_paths, load_day, run_pipeline
+def _settings(args: argparse.Namespace, groups: list[list[str]]) -> tuple[Settings, list[str]]:
+    """CLI flags over ess_config.json (read next to the first log) over defaults."""
+    folder = os.path.dirname(os.path.abspath(groups[0][0])) if groups else os.getcwd()
+    s, problems = load_settings(folder)
+    if args.door is not None:
+        s.door_s = args.door
+    if args.target is not None:
+        s.target_rate = args.target
+    if args.starved is not None:
+        s.starved_s = args.starved
+    if args.no_door:
+        s.no_door.update({x.strip(): True for x in args.no_door.split(",") if x.strip()})
+    if args.no_door_days:
+        s.no_door_days = sorted(set(s.no_door_days) | {x.strip() for x in args.no_door_days.split(",") if x.strip()})
+    s.output_root = args.out
+    return s, [p for p in problems if "unknown setting" not in p] + s.validate()
 
-    style = {"warning": "[warn] ", "error": "[ERROR] ", "done": "[done] ", "head": "\n== "}
+
+def run_headless(args: argparse.Namespace) -> int:
+    groups = find_logs(args.logs)
+    if not groups:
+        print("No .log or .log.gz files found in: " + ", ".join(args.logs), file=sys.stderr)
+        return 2
+
+    settings, problems = _settings(args, groups)
+    if problems:
+        for p in problems:
+            print(f"error: {p}", file=sys.stderr)
+        return 2
+
+    level_icon = {"head": "\n==", "done": "  [ok]", "warning": "  [warn]",
+                  "error": "  [ERROR]", "muted": "  ", "info": "  "}
 
     def log(level: str, msg: str) -> None:
-        print(f"  {style.get(level, '')}{msg}", flush=True)
+        if args.quiet and level not in ("warning", "error"):
+            return
+        print(f"{level_icon.get(level, '  ')} {msg}")
 
-    days = []
-    for group in group_input_paths(args.files):
-        print(f"Reading {', '.join(os.path.basename(p) for p in group)}")
-        try:
-            day = load_day(group)
-        except LoadError as exc:
-            for lvl, m in exc.messages:
-                log(lvl, m)
-            print(f"  [ERROR] {exc}")
-            return 1
-        for lvl, m in day.messages:
-            log(lvl, m)
-        print(f"  {day.label}: {len(day.cfg['ws_order'])} stations, "
-              + ", ".join(f"{k} {v:,}" for k, v in day.sheet_rows.items() if v is not None))
-        days.append(day)
+    n_days = len(groups)
+    print(f"{n_days} day{'s' if n_days != 1 else ''} to analyse · "
+          f"door {settings.door_s:g} s · target {settings.target_rate:g}/h · "
+          f"starved over {settings.starved_s:g} s")
 
-    enabled = {k for k, _ in ANALYSIS_MODULES}
-    if args.analyses:
-        enabled = {a.strip() for a in args.analyses.split(",") if a.strip()}
-        unknown = enabled - {k for k, _ in ANALYSIS_MODULES}
-        if unknown:
-            print(f"Unknown analyses: {', '.join(sorted(unknown))}")
-            return 2
+    try:
+        result = run(groups, settings, on_log=log)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
-    settings = RunSettings(
-        enabled=enabled,
-        switch_s_fixed=args.switch_s,
-        switch_mode=args.switch_mode,
-        pick_start_event=args.pick_start,
-        output_root=args.out,
-        excel_exports=not args.no_excel,
-    )
-    result = run_pipeline(days, settings, on_log=log)
-    n = sum(len(d.registry) for d in result.days) + len(result.summary_registry)
-    failed = sum(len(d.failures) for d in result.days)
-    print(f"\nComplete in {result.seconds:.1f}s — {n} charts"
-          + (f", {failed} analysis failure(s)" if failed else ""))
-    print(f"  Report: {result.html_path}")
-    print(f"  Folder: {result.run_dir}")
-    return 0
+    done, failed = result.completed, [d for d in result.days if not d.ok]
+    print(f"\nComplete in {result.seconds:.1f}s — {len(done)} of {n_days} day(s)"
+          + (f", {len(failed)} failed" if failed else ""))
+    print(f"  Report:  {result.report}")
+    for d in done:
+        print(f"  {d.date or d.label}: {d.metrics['overall']['visits']:,} totes presented")
+    for d in failed:
+        print(f"  {d.label}: FAILED — {d.error}", file=sys.stderr)
+    print(f"  Folder:  {result.run_dir}")
+
+    if args.open and result.report:
+        import webbrowser
+        webbrowser.open(f"file://{os.path.abspath(result.report)}")
+    return 0 if not failed else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
-    if args.files:
-        missing = [f for f in args.files if not os.path.isfile(f)]
-        if missing:
-            print(f"File not found: {', '.join(missing)}")
-            return 2
-        return run_headless(args)
-
-    from server import launch
-    launch(port=args.port, output_root=args.out,
-           mode="none" if args.no_open else ("browser" if args.browser else "auto"))
-    return 0
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    if not args.logs:
+        from server import launch
+        launch(port=args.port, output_root=args.out,
+               mode="browser" if args.browser else "auto")
+        return 0
+    return run_headless(args)
 
 
 if __name__ == "__main__":

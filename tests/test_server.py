@@ -1,84 +1,204 @@
+"""The local web API behind the UI."""
 from __future__ import annotations
 
-import json
+import os
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from server import create_app
-
-
-def _wait(client, pred, timeout=120):
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        st = client.get("/api/state").json()
-        if pred(st):
-            return st
-        time.sleep(0.2)
-    raise AssertionError("timed out waiting for server state")
+from tests.synthetic import write
 
 
 @pytest.fixture()
 def client(tmp_path):
-    return TestClient(create_app(str(tmp_path / "out")))
+    app = create_app(output_root=str(tmp_path / "out"))
+    with TestClient(app) as c:
+        c.app_state = app.state.session
+        yield c
 
 
-def test_static_and_meta(client):
-    assert "ESS Analyzer" in client.get("/").text
-    assert client.get("/vendor/plotly.min.js").status_code == 200
+@pytest.fixture()
+def logs(tmp_path):
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    write(str(folder / "play_extract_2026-10-01.log"), date="2026-10-01")
+    write(str(folder / "play_extract_2026-10-02.log.gz"), date="2026-10-02")
+    return folder
+
+
+def test_index_and_meta(client):
+    assert client.get("/").status_code == 200
     meta = client.get("/api/meta").json()
-    assert {a["key"] for a in meta["analyses"]} >= {"throughput", "dwell", "quality"}
+    assert meta["app"] and "door_s" in meta["defaults"]
 
 
-def test_upload_run_and_results(client, workbook):
-    with open(workbook, "rb") as fh:
-        cfg = json.dumps({"design_rates": {"LABOR-1": 100}}).encode()
-        r = client.post("/api/files", files=[
-            ("files", ("day1.xlsx", fh.read(), "application/octet-stream")),
-            ("files", ("asrs_config.json", cfg, "application/json")),
-            ("files", ("notes.txt", b"x", "text/plain")),
-        ])
-    body = r.json()
-    assert len(body["added"]) == 1
-    assert any("notes.txt" in m for m in body["rejected"])
-    st = _wait(client, lambda s: s["loading"] == 0)
-    day = st["days"][0]
-    assert day["status"] == "ready" and day["config_file"]
-    assert any(s["station"] == "LABOR-1" and s["design_rate"] == 100 for s in st["stations"])
-
-    # Validation errors are reported, not crashes.
-    assert client.post("/api/run", json={"enabled": ["throughput"], "switch_s_fixed": -1}).status_code == 400
-    assert client.post("/api/run", json={"enabled": []}).status_code == 400
-
-    r = client.post("/api/run", json={"enabled": ["throughput", "dwell", "quality"],
-                                      "station_types": {"LABOR-1": "Express"},
-                                      "excel_exports": False})
-    assert r.status_code == 200
-    st = _wait(client, lambda s: s["job"]["status"] in ("done", "error"))
-    assert st["job"]["status"] == "done", st["job"]
-    assert st["job"]["logs"]
-
-    res = client.get("/api/results").json()
-    charts = res["days"][0]["charts"]
-    assert any(c["id"] == "throughput_total" for c in charts)
-    fig = client.get(f"/api/results/0/{charts[0]['idx']}/figure").json()
-    assert "data" in fig and "layout" in fig
-    rows = client.get(f"/api/results/0/{charts[0]['idx']}/rows").json()
-    assert rows["rows"]
-    assert client.get(res["report_url"]).status_code == 200
-    assert client.get("/api/results/7/0/figure").status_code == 404
-    assert client.get("/api/runs").json()["runs"]
+def test_state_starts_empty(client):
+    st = client.get("/api/state").json()
+    assert st["days"] == [] and st["job"]["status"] == "idle"
 
 
-def test_bad_file_reports_error(client, tmp_path):
-    r = client.post("/api/files", files=[("files", ("broken.xlsx", b"not an excel file", "application/octet-stream"))])
-    assert r.status_code == 200
-    st = _wait(client, lambda s: s["loading"] == 0)
-    assert st["days"][0]["status"] == "error"
-    assert st["days"][0]["error"]
+def test_add_paths_groups_days(client, logs):
+    r = client.post("/api/paths", json={"paths": [str(logs)]}).json()
+    assert r["added"] == 2
+    days = client.get("/api/state").json()["days"]
+    assert [d["date"] for d in days] == ["2026-10-01", "2026-10-02"]
+    assert all(d["bytes"] > 0 for d in days)
 
 
-def test_open_rejects_paths_outside_output(client):
+def test_adding_the_same_file_twice_is_a_no_op(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    again = client.post("/api/paths", json={"paths": [str(logs)]}).json()
+    assert again["added"] == 0
+    assert len(client.get("/api/state").json()["days"]) == 2
+
+
+def test_non_log_files_are_rejected(client, tmp_path):
+    bad = tmp_path / "export.xlsx"
+    bad.write_bytes(b"x")
+    r = client.post("/api/paths", json={"paths": [str(bad)]}).json()
+    assert r["added"] == 0 and r["rejected"]
+
+
+def test_missing_path_is_reported(client, tmp_path):
+    r = client.post("/api/paths", json={"paths": [str(tmp_path / "nope.log")]}).json()
+    assert r["added"] == 0 and "not found" in r["rejected"][0]
+
+
+def test_upload_accepts_a_log(client, logs):
+    path = logs / "play_extract_2026-10-01.log"
+    with open(path, "rb") as fh:
+        r = client.post("/api/upload", files={"files": (path.name, fh, "text/plain")}).json()
+    assert r["added"] == 1
+
+
+def test_upload_rejects_other_files(client):
+    r = client.post("/api/upload", files={"files": ("data.xlsx", b"x", "application/octet-stream")}).json()
+    assert r["added"] == 0 and r["rejected"]
+
+
+def test_remove_and_clear(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    day = client.get("/api/state").json()["days"][0]
+    client.post("/api/days/remove", json={"files": day["files"]})
+    assert len(client.get("/api/state").json()["days"]) == 1
+    client.post("/api/days/clear", json={})
+    assert client.get("/api/state").json()["days"] == []
+
+
+def test_run_requires_files(client):
+    assert client.post("/api/run", json={}).status_code == 400
+
+
+def test_run_rejects_bad_settings(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    assert client.post("/api/run", json={"door_s": -5}).status_code == 400
+    assert client.post("/api/run", json={"door_s": "abc"}).status_code == 400
+
+
+def _wait(client, timeout=180):
+    for _ in range(int(timeout * 10)):
+        st = client.get("/api/state").json()
+        if st["job"]["status"] not in ("running",):
+            return st
+        time.sleep(0.1)
+    raise AssertionError("the run did not finish")
+
+
+def test_full_run_exposes_results(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    assert client.post("/api/run", json={"door_s": 1.5}).status_code == 200
+    st = _wait(client)
+    assert st["job"]["status"] == "done", st["job"]["error"]
+
+    r = client.get("/api/results").json()
+    assert len(r["days"]) == 2 and all(d["ok"] for d in r["days"])
+    for day in r["days"]:
+        assert day["headline"]["visits"] > 0
+    page = client.get(r["report_url"])
+    assert page.status_code == 200 and "const REPORT=" in page.text
+
+
+def test_targets_are_passed_to_the_report(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    assert client.post("/api/run", json={"door_s": 1, "targets": {"LABOR-3": 60, "Zone A": ""}}).status_code == 200
+    st = _wait(client)
+    assert st["job"]["status"] == "done", st["job"]["error"]
+    html = client.get(client.get("/api/results").json()["report_url"]).text
+    assert '"targets":{"LABOR-3":60.0' in html
+
+
+def test_bad_targets_are_rejected(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    assert client.post("/api/run", json={"targets": {"LABOR-1": "fast"}}).status_code == 400
+    assert client.post("/api/run", json={"targets": [270]}).status_code == 400
+
+
+def test_stations_are_found_when_logs_are_added(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    for _ in range(100):
+        st = client.get("/api/state").json()["stations"]
+        if not st["scanning"] and st["zones"]:
+            break
+        time.sleep(0.05)
+    zones = {z["zone"]: z["stations"] for z in st["zones"]}
+    assert zones == {"Zone A": ["LABOR-1", "LABOR-2"], "Zone B": ["LABOR-3"]}
+
+
+def test_results_404_before_a_run(client):
+    assert client.get("/api/results").status_code == 404
+
+
+def test_history_lists_the_run(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    client.post("/api/run", json={})
+    _wait(client)
+    runs = client.get("/api/runs").json()["runs"]
+    assert len(runs) == 1 and runs[0]["url"]
+
+
+def test_open_rejects_paths_outside_the_output_folder(client):
     r = client.post("/api/open", json={"target": "file", "url": "/runs/../../etc/passwd"})
-    assert r.status_code == 400
+    assert r.status_code in (400, 404)
+
+
+def test_pick_and_switch_targets_reach_the_report(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    r = client.post("/api/run", json={"pick_s": {"Zone A": 8.5}, "switch_s": {"LABOR-3": 5}})
+    assert r.status_code == 200
+    st = _wait(client)
+    assert st["job"]["status"] == "done", st["job"]["error"]
+    html = client.get(client.get("/api/results").json()["report_url"]).text
+    assert '"pick_s":{"Zone A":8.5}' in html and '"switch_s":{"LABOR-3":5.0}' in html
+
+
+def test_no_door_reaches_the_report(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    assert client.post("/api/run", json={"no_door": {"LABOR-3": True}}).status_code == 200
+    st = _wait(client)
+    assert st["job"]["status"] == "done", st["job"]["error"]
+    html = client.get(client.get("/api/results").json()["report_url"]).text
+    assert '"no_door":{"LABOR-3":true}' in html
+    assert client.post("/api/run", json={"no_door": "LABOR-3"}).status_code == 400
+
+
+def test_no_door_days_reach_the_report(client, logs):
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    assert client.post("/api/run", json={"no_door_days": ["2026-10-02"]}).status_code == 200
+    st = _wait(client)
+    assert st["job"]["status"] == "done", st["job"]["error"]
+    html = client.get(client.get("/api/results").json()["report_url"]).text
+    assert '"no_door_days":{"2026-10-02":true}' in html
+    assert client.post("/api/run", json={"no_door_days": ["Oct 2"]}).status_code == 400
+
+
+def test_starved_threshold_is_a_run_setting(client, logs):
+    assert client.get("/api/meta").json()["defaults"]["starved_s"] == 1.0
+    client.post("/api/paths", json={"paths": [str(logs)]})
+    assert client.post("/api/run", json={"starved_s": -1}).status_code == 400
+    assert client.post("/api/run", json={"starved_s": 2}).status_code == 200
+    st = _wait(client)
+    assert st["job"]["status"] == "done", st["job"]["error"]
+    html = client.get(client.get("/api/results").json()["report_url"]).text
+    assert '"starved_s":2.0' in html

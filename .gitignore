@@ -3,6 +3,8 @@ asrs_analysis_output/
 
 # Log files (too large for GitHub)
 LOG FILES/
+*.log
+*.log.gz
 
 # Python
 __pycache__/
@@ -15,11 +17,6 @@ dist/
 build/
 .venv/
 venv/
-
-# Data files
-*.xlsx
-*.xls
-*.csv
 
 # IDE
 .vscode/

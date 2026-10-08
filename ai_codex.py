@@ -75,37 +75,6 @@ def extract_functions(content: str, method: bool = False) -> list[dict]:
         results.append({'name': name, 'params': params})
     return results
 
-def extract_chart_ids(content: str) -> list[dict]:
-    """
-    Extract chart id and title pairs from analysis modules.
-    Looks for patterns like:
-        "id": "some_id",
-        "title": "Some Title",
-    """
-    results = []
-    # Find all dict-literal pairs near each other
-    id_pattern = re.compile(r'"id"\s*:\s*"([^"]+)"')
-    title_pattern = re.compile(r'"title"\s*:\s*"([^"]+)"')
-
-    id_matches = [(m.start(), m.group(1)) for m in id_pattern.finditer(content)]
-    title_matches = [(m.start(), m.group(1)) for m in title_pattern.finditer(content)]
-
-    # Pair each id with the nearest title within 300 chars
-    used_titles = set()
-    for id_pos, id_val in id_matches:
-        best_title = None
-        best_dist = 9999
-        for t_pos, t_val in title_matches:
-            dist = abs(t_pos - id_pos)
-            if dist < best_dist and dist < 300 and t_val not in used_titles:
-                best_dist = dist
-                best_title = t_val
-        if best_title:
-            used_titles.add(best_title)
-            results.append({'id': id_val, 'title': best_title})
-
-    return results
-
 def extract_constants(content: str) -> list[dict]:
     """Extract top-level constant assignments (UPPER_CASE names)."""
     results = []
@@ -119,79 +88,13 @@ def extract_constants(content: str) -> list[dict]:
     return results
 
 # ---------------------------------------------------------------------------
-# 1. analyses-index.md
-# ---------------------------------------------------------------------------
-
-def generate_analyses_index() -> str:
-    analyses_dir = os.path.join(ROOT, 'analyses')
-    if not os.path.exists(analyses_dir):
-        return None
-
-    py_files = sorted(
-        f for f in os.listdir(analyses_dir)
-        if f.endswith('.py') and f != '__init__.py'
-    )
-    if not py_files:
-        return None
-
-    output = [
-        f"# Analyses Index (generated {TODAY})",
-        f"# Each module exports run(data, cfg) -> list[ChartResult]",
-        f"# ChartResult keys: id, title, figure, source, method, export_hint",
-        ""
-    ]
-
-    for filename in py_files:
-        filepath = os.path.join(analyses_dir, filename)
-        content = read_file_safe(filepath)
-        if not content:
-            continue
-
-        module_name = filename[:-3]
-        docstring = extract_module_docstring(content)
-        line_count = len(content.splitlines())
-        charts = extract_chart_ids(content)
-        fns = extract_functions(content)
-
-        output.append(f"## {module_name}.py  ({line_count} lines)")
-        if docstring:
-            output.append(f"   {docstring}")
-        output.append("")
-
-        if charts:
-            output.append("   Charts:")
-            for c in charts:
-                output.append(f"     {pad(c['id'], 35)} {c['title']}")
-        else:
-            output.append("   Charts: (no chart IDs detected)")
-
-        if fns:
-            output.append("")
-            output.append("   Functions:")
-            for fn in fns:
-                output.append(f"     {pad('def ' + fn['name'], 30)} ({fn['params']})")
-        output.append("")
-
-    # Also document __init__.py ChartResult schema
-    init_path = os.path.join(analyses_dir, '__init__.py')
-    init_content = read_file_safe(init_path)
-    if init_content:
-        output.append("## __init__.py — ChartResult schema")
-        output.append("   Keys expected in every dict returned by run():")
-        for key in ['id', 'title', 'figure', 'source', 'method', 'export_hint']:
-            output.append(f"     {key}")
-        output.append("")
-
-    return '\n'.join(output)
-
-# ---------------------------------------------------------------------------
-# 2. python-modules.md
+# 1. python-modules.md
 # ---------------------------------------------------------------------------
 
 def generate_python_modules() -> str:
     root_py_files = [
-        'app.py', 'config.py', 'data_loader.py', 'pipeline.py', 'exports.py',
-        'report_builder.py', 'server.py', 'log_converter.py'
+        'app.py', 'config.py', 'log_parser.py', 'metrics.py',
+        'report.py', 'pipeline.py', 'server.py',
     ]
 
     output = [
@@ -239,167 +142,146 @@ def generate_python_modules() -> str:
 # 3. data-schema.md
 # ---------------------------------------------------------------------------
 
-def generate_data_schema() -> str:
-    """
-    Documents the expected Excel column names and config structure
-    by scanning data_loader.py and config.py for Chinese string literals
-    and cfg dict keys.
-    """
-    loader_path = os.path.join(ROOT, 'data_loader.py')
-    config_path = os.path.join(ROOT, 'config.py')
-
-    loader_content = read_file_safe(loader_path)
-    config_content = read_file_safe(config_path)
-
-    if not loader_content:
-        return None
-
-    output = [
-        f"# Data Schema Reference (generated {TODAY})",
-        f"# Expected Excel sheets, column names, and runtime config keys",
-        ""
-    ]
-
-    # ── Sheet types ──
-    output.append("## Excel Sheets (auto-detected by signature columns)")
-    sheet_signatures = [
-        ('callback',   ['動作類型', '位置類型', '時間戳'],          'Robot event log (complete, arrive events at stations)'),
-        ('station',    ['事件類型', '機器人編號', '位置編號'],        'Labor station robot events (arrived, triggerGo, release)'),
-        ('lifecycle',  ['任務全程耗時', '目標位置', '起始位置'],      'Container task lifecycle with duration per stage'),
-    ]
-    for sheet, cols, desc in sheet_signatures:
-        output.append(f"  {pad(sheet, 12)} {desc}")
-        for col in cols:
-            output.append(f"               • {col}")
-    output.append("")
-
-    # ── Key column names ──
-    output.append("## Key Column Names (Chinese field names in source data)")
-    columns_doc = [
-        ('動作類型',              'Action type (complete, etc.) — callback sheet'),
-        ('位置類型',              'Location type (LABOR, storage) — callback sheet'),
-        ('時間戳',               'Timestamp — all sheets'),
-        ('機器人編號',            'Robot ID — station sheet'),
-        ('機器人類型',            'Robot model/type (e.g. K50) — station sheet'),
-        ('位置編號',              'Location code (LABOR:0:X:Y) — station sheet'),
-        ('事件類型',              'Event type (arrived, triggerGo, release, ppReady) — station sheet'),
-        ('任務全程耗時(秒)',       'Total task duration in seconds — lifecycle sheet'),
-        ('complete(任務完成時間)', 'Task completion timestamp — lifecycle sheet'),
-        ('起始位置',              'Source location (HAI-aisle-bay-level-...) — lifecycle sheet'),
-        ('目標位置',              'Destination location (LABOR-N) — lifecycle sheet'),
-        ('容器編號',              'Container / tote ID — lifecycle sheet'),
-        ('*耗時(秒)',             'Stage duration columns (suffix pattern) — lifecycle sheet'),
-    ]
-    for col, desc in columns_doc:
-        output.append(f"  {pad(col, 28)} {desc}")
-    output.append("")
-
-    # ── Stage labels map ──
-    output.append("## Stage Label Map (Chinese → English, from config.py)")
-    stage_map_match = re.search(
-        r'STAGE_LABEL_MAP\s*=\s*\{([^}]+)\}', config_content, re.DOTALL
-    )
-    if stage_map_match:
-        for line in stage_map_match.group(1).splitlines():
-            line = line.strip().strip(',')
-            if line and not line.startswith('#'):
-                output.append(f"  {line}")
-    else:
-        # Fallback: find any dict with Chinese keys
-        for line in config_content.splitlines():
-            if '→' in line or ('":"' in line and any(ord(c) > 127 for c in line)):
-                output.append(f"  {line.strip()}")
-    output.append("")
-
-    # ── Runtime cfg dict keys ──
-    output.append("## Runtime cfg Dict Keys (built by data_loader.build_config)")
-    cfg_keys = [
-        ('ws_order',          'list[str]',         'Ordered station names'),
-        ('type_map',          'dict[str, str]',     'Station → zone type'),
-        ('type_colors',       'dict[str, str]',     'Zone type → hex colour'),
-        ('design_rate',       'dict[str, int]',     'Station → target tasks/hr'),
-        ('design_total_rate', 'int | None',         'Sum of all design rates'),
-        ('point2ws',          'dict[str, str]',     'Location code → station name'),
-        ('stages',            'list[str]',          'Lifecycle stage column names'),
-        ('stage_lbl',         'list[str]',          'Human-readable stage labels'),
-        ('stage_col',         'list[str]',          'Hex colour per stage'),
-        ('amr_type',          'str | None',         'Delivery AMR type string, e.g. "K50"'),
-        ('switch_s_fixed',    'float',              'User-set flat robot switch/wait time (s); default SWITCH_S_FALLBACK'),
-        ('switch_mode',       'str',                '"fixed" (use switch_s_fixed) or "measured" (per-station measured switch)'),
-        ('switch_measured',   'dict[str, float]',   'Per-station measured operational-switch median (s); {} if unavailable'),
-        ('pick_start_event',  'str',                '"arrived" (standard) or "ppReady" (fallback when export lacks arrived events)'),
-    ]
-    output.append(f"  {pad('key', 20)} {pad('type', 18)} description")
-    output.append(f"  {'-'*20} {'-'*18} {'-'*30}")
-    for key, typ, desc in cfg_keys:
-        output.append(f"  {pad(key, 20)} {pad(typ, 18)} {desc}")
-    output.append("")
-
-    # ── asrs_config.json override ──
-    output.append("## asrs_config.json (optional, placed next to .xlsx)")
-    output.append("  Keys: station_types, design_rates, type_colors, amr_type, switch_s_fixed, switch_mode, pick_start_event")
-    output.append('  Example:')
-    output.append('    { "station_types": {"LABOR-1": "Zone A"},')
-    output.append('      "design_rates":  {"LABOR-1": 120},')
-    output.append('      "type_colors":   {"Zone A": "#ff6b6b"},')
-    output.append('      "amr_type":      "K50",')
-    output.append('      "switch_s_fixed": 6,')
-    output.append('      "switch_mode":   "fixed",')
-    output.append('      "pick_start_event": "arrived" }')
-    output.append("")
-
-    # ── Location code format ──
-    output.append("## Location Code Formats")
-    output.append("  LABOR station:   LABOR:0:<x>:<y>   (grouped by Y coord into zones A,B,C,...)")
-    output.append("  Storage grid:    HAI-<aisle>-<bay>-<level>-<col>")
-    output.append("  Destination:     LABOR-<N>          (matches station record label)")
-    output.append("")
-
-    return '\n'.join(output)
-
 # ---------------------------------------------------------------------------
-# 4. docs-index.md
+# 2. log-schema.md
 # ---------------------------------------------------------------------------
 
-def generate_docs_index() -> str:
-    md_files = sorted(f for f in os.listdir(ROOT) if f.endswith('.md'))
-    ai_codex_files = []
-    if os.path.exists(OUTPUT_DIR):
-        ai_codex_files = sorted(os.listdir(OUTPUT_DIR))
+EVENTS = [
+    ('CALLBACK_OF_ROBOT_REACH_STATION', 'arrival',
+     'robot reaches a station (the tote becomes pickable)'),
+    ('EssKubotStationHandleLetRobotGo', 'release',
+     '"station: X robot: Y will leave" - the operator release'),
+    ('CALLBACK_OF_TOTE_LOADED_BY_ROBOT', 'move start', 'tote picked up'),
+    ('CALLBACK_OF_TOTE_UNLOADED_BY_ROBOT', 'move end', 'tote put down'),
+    ('CALLBACK_OF_TASK_ALLOCATED', 'busy from', 'robot given a task; stationCode = K50 destination'),
+    ('wmsTask[...]: ND... is created', 'supply', 'task created by the warehouse system (destinationCodes)'),
+]
 
-    if not md_files and not ai_codex_files:
-        return None
+DEFINITIONS = [
+    'operator time   release - arrival, as logged (so it includes door travel)',
+    'gap             next arrival at that station - release, as logged',
+    'switch time     gap + door_s (the door-open command is logged at the arrival,',
+    '                so the door\'s physical travel never appears in the log)',
+    'K50 cycle       buffer pickup -> one or more station visits -> buffer return',
+    'multi-station   a cycle whose tote was presented at 2+ stations before returning',
+    'ACR move        storage->buffer = put, buffer->storage = store, else relocation',
+    'hour budget     door + picking + switch + waiting, every interval clipped to the',
+    '                hour, so the shares always sum to the hour',
+    'time budget     3600 / target seconds per tote vs mean pick + switch + wait',
+    '                (means, because they add up to the real cycle = 3600 / rate)',
+    'target pickable 1 - target x median switch / 3600',
+    'robot states    on a task (allocation -> tote put down) / between tasks (gap < AWAY_MIN_S)',
+    '                / away (gap >= AWAY_MIN_S, most likely charging - not in the log)',
+    'utilization     on a task / available (on task + between); also / day fleet (lower bound)',
+    'task supply     created -> tote ready in buffer (ACR put; same slot as the K50 pickup)',
+    '                -> K50 allocated; a K50 is never allocated before the tote is ready',
+    'handover        a release and the next arrival at that station; its wait is the gap',
+    '                beyond the station median gap; starved = wait > starved_s (default 1 s)',
+    'starve stages   where the arriving robot was in each waiting second: no task yet /',
+    '                ACR / tote ready, no K50 / K50 to buffer / carrying the tote /',
+    '                at another station - split exactly, so they sum to the wait',
+    'en route        K50s allocated to the station, not yet arrived, at the release',
+    'station slots   tasks assigned to a station (K50 alloc -> release); a limit is a',
+    '                ceiling it sits at while its ready totes pile up behind it',
+    'zone            stations on the same row (same Y of their LT_LABOR:POINT)',
+    'rack slot       HAI-<aisle>-<bay>-<level>_<depth>[_coop_kubot|_coop_haiflex]',
+    'aisle crowding  allocation -> pickup vs other trips of that fleet bound for the same',
+    '                aisle at the allocation; excess over the median lead at the same',
+    '                fleet-wide load; overlap vs chance = same / (fleet x sum share^2)',
+    'return trip     a store (buffer -> storage) whose tote is put again later; minutes',
+    '                until that next put, in bands',
+    'buffer travel   K50 buffer pickup -> first arrival, by buffer aisle x station',
+]
 
-    output = [
-        f"# Documentation Registry (generated {TODAY})",
-        ""
+SETTINGS = [
+    ('door_s', 'DOOR_S_DEFAULT', 'seconds of door travel added to every switch'),
+    ('target_rate', 'TARGET_RATE_DEFAULT', 'auto target for high-rate zones'),
+    ('starved_s', 'STARVED_S_DEFAULT', 'wait beyond the median handover that counts as starved (run setting)'),
+]
+SETTING_TABLES = ['targets  {station|zone: totes/h}', 'pick_s   {station|zone: s}  blank = budget - switch',
+                  'switch_s {station|zone: s}  blank = measured median switch',
+                  'no_door  {station|zone: bool} True = no door (no door seconds there); default: door',
+                  'no_door_days [YYYY-MM-DD]   days the doors were not in use: no door seconds at all']
+
+TUNING = ('FULL_HOUR_SHARE', 'HIGH_RATE_SHARE', 'LONG_PICK_S',
+          'IDLE_MIN_MINUTES', 'MAX_SWITCH_S', 'DOOR_S_MAX', 'AWAY_MIN_S')
+
+
+def _const(content: str, name: str) -> str:
+    m = re.search(r'^' + name + r'\s*=\s*(.+)$', content, re.MULTILINE)
+    return m.group(1).strip() if m else '?'
+
+
+def generate_log_schema() -> str:
+    """Document the log events consumed and the settings that tune a run."""
+    parser = read_file_safe(os.path.join(ROOT, 'log_parser.py'))
+    cfg = read_file_safe(os.path.join(ROOT, 'config.py'))
+    if not parser or not cfg:
+        return ''
+
+    out = [
+        f"# Log Schema Reference (generated {TODAY})",
+        "# Input: Hairobotics play_extract application logs (.log / .log.gz)",
+        "",
+        "## Log line format",
+        "  [thread] YYYY-MM-DD HH:MM:SS,mmm [LEVEL] from <class>-line:<n> - <body>",
+        "  Timestamps are the log line's own local time, millisecond precision.",
+        "",
+        "## Lines consumed",
     ]
+    for name, role, note in EVENTS:
+        out.append(f"  {pad(name, 36)} {pad(role, 11)} {note}")
+    out += [
+        "",
+        "  NOTE  CALLBACK_OF_TASK_FINISHED fires in the same millisecond as the arrival,",
+        "        so it is never the operator release. Only the 'will leave' line is.",
+        "",
+        "## Native frames (log_parser.LogData)",
+        "  arrivals     ts, station, robot, tote, point",
+        "  releases     ts, station, robot",
+        "  tote_events  ts, kind (load/unload), robot, tote, loc, task",
+        "  allocations  ts, robot, task, station",
+        "  created      ts, task, dest",
+        "  moves        robot, tote, t_load, t_unload, from_loc, to_loc, task",
+        "  roles        {robot: 'K50' | 'ACR'}",
+        "",
+        "## Robot roles (read from behaviour, not from the robot numbering)",
+        "  K50   reaches a station, reports a HAIFLEX type, or works the haiflex buffer",
+        "  ACR   everything else - shelf storage to and from the kubot buffer",
+        "",
+        "## Location tokens",
+    ]
+    for const in ('BUFFER_K50', 'BUFFER_ACR', 'STATION_PREFIX'):
+        out.append(f"  {pad(const, 16)} {_const(parser, const)}")
 
-    if md_files:
-        output.append("## Markdown files in root/")
-        for md in md_files:
-            output.append(f"  - {md}")
-        output.append("")
+    out += ["", "## Metric definitions"]
+    out += ["  " + line for line in DEFINITIONS]
 
-    if ai_codex_files:
-        output.append("## AI-Codex index files (.ai-codex/)")
-        for f in ai_codex_files:
-            if f != 'docs-index.md':
-                output.append(f"  - .ai-codex/{f}")
-        output.append("")
+    out += ["", "## Settings (config.Settings; ess_config.json next to the logs)"]
+    for key, default, note in SETTINGS:
+        out.append(f"  {pad(key, 14)} default {pad(_const(cfg, default), 8)} {note}")
 
-    output.append("## Output directory")
-    output.append("  asrs_analysis_output/{YYYY-MM-DD}/")
-    output.append("    asrs_analysis_report.html  — main deliverable (self-contained)")
-    output.append("    throughput_by_workstation_hour.xlsx")
-    output.append("    cycle_time_distribution.xlsx")
-    output.append("    retrieval_demand_by_aisle.xlsx")
-    output.append("    retrieval_demand_by_bay.xlsx")
-    output.append("    robot_dwell_intervals.xlsx")
-    output.append("    robot_switch_time_intervals.xlsx")
-    output.append("")
+    for line in SETTING_TABLES:
+        out.append("  " + line)
+    out.append("  station entries beat zone entries; 0 = none")
 
-    return '\n'.join(output)
+    out += ["", "## Tuning constants (config.py)"]
+    for const in TUNING:
+        out.append(f"  {pad(const, 20)} {_const(cfg, const)}")
+
+    out += [
+        "",
+        "## Output per run",
+        "  <run>/station_robot_cycle_report.html   one self-contained file: summary + every day",
+        "",
+        "## Where each number is computed",
+        "  metrics.py (Python)          door- and target-independent: operator time, cycles,",
+        "                               utilization, zero-door hour budget, sorted raw arrays",
+        "  templates/engine.js (browser) everything that moves with door_s or a target:",
+        "                               switch stats, time pickable, time budget, summary",
+        "",
+    ]
+    return '\n'.join(out)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -415,10 +297,8 @@ def main():
         return
 
     generators = [
-        ('analyses-index.md',   generate_analyses_index),
         ('python-modules.md',   generate_python_modules),
-        ('data-schema.md',      generate_data_schema),
-        ('docs-index.md',       generate_docs_index),
+        ('log-schema.md',       generate_log_schema),
     ]
 
     total_files = 0

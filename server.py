@@ -1,18 +1,19 @@
 """
 server.py — local web server behind the desktop UI (webui/).
 
-The UI is a single-page app talking to this JSON API on 127.0.0.1.  All heavy
-work runs on background threads; the page polls /api/state.  The server is
-single-user by design: it keeps one session's loaded days and the latest run
-in memory.
+A single-page app talking to this JSON API on 127.0.0.1.  The run happens on a
+background thread and the page polls /api/state.  Single-user by design: one
+session's files and its latest run live in memory.
+
+Unlike the old Excel pipeline there is no load-and-validate step — a log is only
+read when the run starts — so adding files is instant and the UI stays simple.
 
     launch(mode="auto")   native window via pywebview when installed,
-                          otherwise the default web browser.
+                          otherwise the default browser.
 """
 from __future__ import annotations
 
 import atexit
-import json
 import logging
 import os
 import shutil
@@ -25,40 +26,28 @@ import time
 import urllib.parse
 import uuid
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
 
 from fastapi import Body, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from analyses._common import natural_key
-from config import (
-    ANALYSIS_MODULES,
-    DEFAULT_CHECKED,
-    MAX_OPERATIONAL_SWITCH_S,
-    PICK_START_EVENTS,
-    SWITCH_S_FALLBACK,
-)
-from data_loader import PREFLIGHT_OK, best_preflight_status, validate_user_config
+from config import DOOR_S_DEFAULT, DOOR_S_MAX, STARVED_S_DEFAULT, STARVED_S_MAX, TARGET_RATE_DEFAULT, Settings
+from log_parser import LogError, assign_zones, is_log_path, log_date, log_stem, natural_key, scan_stations
 from pipeline import (
-    LoadError,
-    LoadedDay,
     RunCancelled,
     RunResult,
-    RunSettings,
     default_output_root,
-    group_input_paths,
-    load_day,
-    run_pipeline,
+    find_logs,
+    run,
 )
+from report import REPORT_NAME
 
 _log = logging.getLogger(__name__)
 
 APP_NAME = "ESS Analyzer"
-VERSION = "3.0"
-_ALLOWED_EXT = {".xlsx", ".xlsm", ".log", ".json"}
+VERSION = "4.0"
+_ALLOWED_EXT = (".log", ".log.gz")
 
 
 def _resource_dir() -> str:
@@ -69,26 +58,9 @@ def _resource_dir() -> str:
 WEBUI_DIR = os.path.join(_resource_dir(), "webui")
 
 
-def _plotly_js_path() -> str:
-    import plotly
-    return os.path.join(os.path.dirname(plotly.__file__), "package_data", "plotly.min.js")
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Session state
 # ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class DayEntry:
-    id: str
-    paths: list[str]
-    label: str
-    status: str = "loading"            # loading | ready | error
-    error: str = ""
-    messages: list[tuple[str, str]] = field(default_factory=list)
-    day: LoadedDay | None = None
-    label_edited: bool = False
-
 
 @dataclass
 class Job:
@@ -106,387 +78,304 @@ class Job:
 class Session:
     def __init__(self, output_root: str | None = None):
         self.lock = threading.RLock()
-        self.days: dict[str, DayEntry] = {}
-        self.order: list[str] = []
+        self.paths: list[str] = []          # every log file the user added
         self.job = Job()
         self.result: RunResult | None = None
+        self.settings = Settings()
+        self.points: dict[str, tuple[int, int]] = {}    # station -> (x, y), from quick scans
+        self.scanned: set[str] = set()
+        self.scanning = 0
         self.output_root = output_root or default_output_root()
         self.upload_dir = tempfile.mkdtemp(prefix="ess_uploads_")
-        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ess-load")
         atexit.register(shutil.rmtree, self.upload_dir, True)
 
-    # ── loading ───────────────────────────────────────────────────────────────
+    # ── files ─────────────────────────────────────────────────────────────────
 
-    def add_paths(self, paths: list[str]) -> list[str]:
-        data_paths = [p for p in paths if os.path.splitext(p)[1].lower() != ".json"]
-        known = {p for e in self.days.values() for p in e.paths}
-        ids: list[str] = []
-        for group in group_input_paths([p for p in data_paths if p not in known]):
-            entry = DayEntry(id=uuid.uuid4().hex[:10], paths=group,
-                             label=os.path.splitext(os.path.basename(group[0]))[0])
-            with self.lock:
-                self.days[entry.id] = entry
-                self.order.append(entry.id)
-            ids.append(entry.id)
-            self.pool.submit(self._load, entry.id)
-        return ids
+    def add(self, paths: list[str]) -> tuple[int, list[str]]:
+        """Add files or folders.  Returns (added, rejected messages)."""
+        rejected: list[str] = []
+        wanted: list[str] = []
+        for p in paths:
+            if os.path.isdir(p):
+                hits = [f for f in (os.path.join(p, n) for n in sorted(os.listdir(p)))
+                        if is_log_path(f) and os.path.isfile(f)]
+                if not hits:
+                    rejected.append(f"{os.path.basename(p)}: no .log or .log.gz files inside")
+                wanted += hits
+            elif is_log_path(p) and os.path.isfile(p):
+                wanted.append(p)
+            else:
+                rejected.append(f"{os.path.basename(p)}: not a .log or .log.gz file")
 
-    def _load(self, day_id: str) -> None:
-        entry = self.days.get(day_id)
-        if entry is None:
-            return
+        with self.lock:
+            known = set(self.paths)
+            fresh = [p for p in wanted if p not in known]
+            self.paths += fresh
+            self.paths.sort(key=os.path.basename)
+        if fresh:
+            threading.Thread(target=self._scan, args=(fresh,), daemon=True, name="ess-scan").start()
+        return len(fresh), rejected
+
+    def _scan(self, paths: list[str]) -> None:
+        """Find the stations in newly added logs, so targets can be set per
+        station before a run.  Stops a few percent into each file."""
+        with self.lock:
+            self.scanning += 1
         try:
-            day = load_day(entry.paths)
+            for p in paths:
+                if p in self.scanned:
+                    continue
+                try:
+                    found = scan_stations(p)
+                except LogError:
+                    found = {}
+                with self.lock:
+                    self.scanned.add(p)
+                    for st, xy in found.items():
+                        self.points.setdefault(st, xy)
+        finally:
             with self.lock:
-                if day_id not in self.days:
-                    return
-                labels = {e.label for e in self.days.values()
-                          if e.id != day_id and e.status == "ready"}
-                msgs = list(day.messages)
-                if day.label in labels:
-                    msgs.insert(0, ("warning", f"Another loaded file is also dated {day.label} — "
-                                               "rename one of the days to tell them apart."))
-                if not entry.label_edited:
-                    entry.label = day.label
-                entry.day, entry.messages, entry.status = day, msgs, "ready"
-        except LoadError as exc:
-            with self.lock:
-                entry.status, entry.error = "error", str(exc)
-                entry.messages = exc.messages or [("error", str(exc))]
-        except Exception as exc:  # unexpected — keep the app alive
-            _log.exception("Loading %s failed", entry.paths)
-            with self.lock:
-                entry.status, entry.error = "error", f"{type(exc).__name__}: {exc}"
-                entry.messages = [("error", entry.error)]
+                self.scanning -= 1
+
+    def stations_json(self) -> dict:
+        with self.lock:
+            points = dict(self.points)
+            scanning = self.scanning > 0
+        zones = assign_zones(points)
+        by_zone: dict[str, list[str]] = {}
+        for st in sorted(zones, key=natural_key):
+            by_zone.setdefault(zones[st], []).append(st)
+        return {
+            "scanning": scanning,
+            "zones": [{"zone": z, "stations": s}
+                      for z, s in sorted(by_zone.items(), key=lambda kv: natural_key(kv[0]))],
+        }
+
+    def remove(self, names: list[str]) -> None:
+        with self.lock:
+            drop = set(names)
+            self.paths = [p for p in self.paths if os.path.basename(p) not in drop]
+
+    def clear(self) -> None:
+        with self.lock:
+            self.paths = []
+
+    def groups(self) -> list[list[str]]:
+        with self.lock:
+            return find_logs(list(self.paths))
+
+    def days_json(self) -> list[dict]:
+        out = []
+        for g in self.groups():
+            size = sum(os.path.getsize(p) for p in g if os.path.isfile(p))
+            out.append({
+                "label": log_stem(g[0]),
+                "date": log_date(g[0]),
+                "files": [os.path.basename(p) for p in g],
+                "paths": g,
+                "bytes": size,
+            })
+        return out
 
     # ── running ───────────────────────────────────────────────────────────────
 
-    def start_run(self, settings: RunSettings) -> str:
+    def start(self, settings: Settings) -> str:
+        groups = self.groups()
+        if not groups:
+            raise HTTPException(400, "Add at least one log file first.")
         with self.lock:
             if self.job.status == "running":
                 raise HTTPException(409, "A run is already in progress.")
-            entries = [self.days[i] for i in self.order if i in self.days]
-            if any(e.status == "loading" for e in entries):
-                raise HTTPException(409, "Files are still loading.")
-            ready = [e for e in entries if e.status == "ready" and e.day is not None]
-            if not ready:
-                raise HTTPException(400, "Load at least one file first.")
-            if not settings.enabled:
-                raise HTTPException(400, "Select at least one analysis.")
-            days = []
-            for e in ready:
-                e.day.label = e.label
-                days.append(e.day)
-            self.job = Job(id=uuid.uuid4().hex[:10], status="running", started=time.time())
+            problems = settings.validate()
+            if problems:
+                raise HTTPException(400, "; ".join(problems))
+            self.settings = settings
+            self.job = Job(id=uuid.uuid4().hex[:8], status="running",
+                           started=time.time(), step="Starting")
             job = self.job
-        settings.output_root = self.output_root
-        threading.Thread(target=self._run, args=(job, days, settings),
+        threading.Thread(target=self._run, args=(job, groups, settings),
                          daemon=True, name="ess-run").start()
         return job.id
 
-    def _run(self, job: Job, days: list[LoadedDay], settings: RunSettings) -> None:
+    def _run(self, job: Job, groups: list[list[str]], settings: Settings) -> None:
         def on_progress(pct: float, step: str) -> None:
-            job.progress, job.step = round(pct, 1), step
+            job.progress, job.step = pct, step
 
         def on_log(level: str, msg: str) -> None:
-            with self.lock:
-                job.logs.append({"t": round(time.time() - job.started, 1),
-                                 "level": level, "msg": msg})
+            job.logs.append({"t": round(time.time() - job.started, 1),
+                             "level": level, "msg": msg})
 
         try:
-            result = run_pipeline(days, settings, on_progress, on_log, job.cancel)
+            settings.output_root = self.output_root
+            result = run(groups, settings, on_progress=on_progress,
+                         on_log=on_log, cancel=job.cancel)
             with self.lock:
                 self.result = result
-                job.status, job.progress = "done", 100.0
+                job.status = "done"
+                job.progress = 100.0
         except RunCancelled:
-            on_log("warning", "Run cancelled.")
             job.status = "cancelled"
+            job.step = "Cancelled"
         except Exception as exc:
+            job.status = "error"
+            job.error = f"{type(exc).__name__}: {exc}"
+            on_log("error", job.error)
             _log.exception("Run failed")
-            on_log("error", f"Run failed — {type(exc).__name__}: {exc}")
-            job.status, job.error = "error", f"{type(exc).__name__}: {exc}"
         finally:
             job.finished = time.time()
 
-    # ── views ─────────────────────────────────────────────────────────────────
-
-    def stations(self) -> list[dict]:
-        """Union of stations across ready days (first day wins for defaults)."""
-        rows: dict[str, dict] = {}
-        for i in self.order:
-            e = self.days.get(i)
-            if not e or e.status != "ready" or e.day is None:
-                continue
-            cfg = e.day.cfg
-            for ws in cfg["ws_order"]:
-                if ws in rows:
-                    continue
-                rows[ws] = {
-                    "station": ws,
-                    "zone": cfg["type_map"].get(ws, ""),
-                    "design_rate": cfg["design_rate"].get(ws),
-                    "measured_switch_s": _round(cfg.get("switch_measured", {}).get(ws), 1),
-                }
-        return [rows[k] for k in sorted(rows, key=natural_key)]
-
     def state(self, log_from: int = 0) -> dict:
-        with self.lock:
-            entries = [self.days[i] for i in self.order if i in self.days]
-            days = [_day_json(e) for e in entries]
-            ready = [e.day for e in entries if e.status == "ready" and e.day]
-            availability = {}
-            for key, label in ANALYSIS_MODULES:
-                statuses = [next((f for f in d.preflight if f["key"] == key), None) for d in ready]
-                statuses = [f for f in statuses if f]
-                best = best_preflight_status([f["status"] for f in statuses]) if statuses else None
-                reason = next((f["reason"] for f in statuses if f["status"] == best and f["reason"]), "")
-                availability[key] = {"status": best, "reason": reason}
-            pick = {
-                "any_missing_arrived": any(not d.pick_source.get("arrived") for d in ready),
-                "ppready_possible": any(d.pick_source.get("ppready") for d in ready),
-            }
-            job = self.job
-            return {
-                "days": days,
-                "loading": sum(1 for e in entries if e.status == "loading"),
-                "stations": self.stations(),
-                "availability": availability,
-                "pick_source": pick,
-                "job": {
-                    "id": job.id, "status": job.status, "progress": job.progress,
-                    "step": job.step, "error": job.error,
-                    "elapsed": round((job.finished or time.time()) - job.started, 1) if job.started else 0,
-                    "log_total": len(job.logs),
-                    "logs": job.logs[log_from:],
-                },
-                "has_result": self.result is not None,
-            }
-
-
-def _round(v, nd):
-    return None if v is None else round(float(v), nd)
-
-
-def _day_json(e: DayEntry) -> dict:
-    d = e.day
-    out: dict[str, Any] = {
-        "id": e.id, "label": e.label, "status": e.status, "error": e.error,
-        "files": [os.path.basename(p) for p in e.paths],
-        "messages": [{"level": lvl, "text": m} for lvl, m in e.messages],
-    }
-    if d is not None:
-        out.update({
-            "date": d.date,
-            "sheets": d.sheet_rows,
-            "stations": len(d.cfg["ws_order"]),
-            "zones": len(set(d.cfg["type_map"].values())),
-            "amr_type": d.cfg.get("amr_type"),
-            "pick_source": d.pick_source,
-            "limited": sum(1 for f in d.preflight if f["status"] != PREFLIGHT_OK),
-            "config_file": bool(d.user_cfg),
-        })
-    return out
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Result serialisation
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _chart_meta(entry: dict, idx: int) -> dict:
-    rows = (entry.get("raw_data") or {}).get("rows") or []
-    return {
-        "idx": idx, "id": entry["id"], "title": entry["title"],
-        "source": entry.get("source", ""), "method": entry.get("method", ""),
-        "rows": len(rows),
-    }
-
-
-def _registry(result: RunResult, day: str) -> list[dict]:
-    if day == "summary":
-        return result.summary_registry
-    try:
-        return result.days[int(day)].registry
-    except (ValueError, IndexError):
-        raise HTTPException(404, "Unknown day")
-
-
-def _rel_url(result: RunResult, path: str | None, root: str) -> str | None:
-    if not path or not os.path.isfile(path):
-        return None
-    rel = os.path.relpath(path, root).replace("\\", "/")
-    return "/runs/" + rel
-
-
-def _open_in_os(path: str) -> None:
-    if sys.platform.startswith("win"):
-        os.startfile(path)  # type: ignore[attr-defined]
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", path])
-    else:
-        subprocess.Popen(["xdg-open", path])
+        j = self.job
+        elapsed = ((j.finished or time.time()) - j.started) if j.started else 0.0
+        return {
+            "days": self.days_json(),
+            "settings": self.settings.to_dict(),
+            "output_root": self.output_root,
+            "job": {
+                "id": j.id, "status": j.status, "progress": round(j.progress, 1),
+                "step": j.step, "error": j.error, "elapsed": round(elapsed, 1),
+                "logs": j.logs[log_from:], "log_total": len(j.logs),
+            },
+            "has_results": self.result is not None,
+            "stations": self.stations_json(),
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # App
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _rel_url(result: RunResult, path: str | None, root: str) -> str | None:
+    if not path:
+        return None
+    rel = os.path.relpath(path, root).replace(os.sep, "/")
+    return "/runs/" + urllib.parse.quote(rel)
+
+
+def _open_in_os(path: str) -> None:
+    if sys.platform.startswith("win"):
+        os.startfile(path)                                    # noqa: S606
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
 def create_app(output_root: str | None = None, native: bool = False) -> FastAPI:
+    app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
     session = Session(output_root)
     os.makedirs(session.output_root, exist_ok=True)
-    app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
     app.state.session = session
-    app.state.native = native
-    app.state.window = None
+
+    app.mount("/static", StaticFiles(directory=WEBUI_DIR), name="static")
+    app.mount("/runs", StaticFiles(directory=session.output_root), name="runs")
 
     @app.get("/")
     def index():
-        return FileResponse(os.path.join(WEBUI_DIR, "index.html"),
-                            headers={"Cache-Control": "no-store"})
-
-    @app.get("/vendor/plotly.min.js")
-    def plotly_js():
-        return FileResponse(_plotly_js_path(), media_type="application/javascript",
-                            headers={"Cache-Control": "max-age=86400"})
-
-    app.mount("/static", StaticFiles(directory=WEBUI_DIR), name="static")
-    app.mount("/runs", StaticFiles(directory=session.output_root, html=True), name="runs")
+        return FileResponse(os.path.join(WEBUI_DIR, "index.html"))
 
     @app.get("/api/meta")
     def meta():
         return {
-            "app": APP_NAME, "version": VERSION,
-            "analyses": [{"key": k, "label": lbl.split("  (")[0].strip(),
-                          "requires": (lbl.split("  (")[1].rstrip(")") if "  (" in lbl else ""),
-                          "default": k in DEFAULT_CHECKED} for k, lbl in ANALYSIS_MODULES],
-            "switch_s_default": SWITCH_S_FALLBACK,
-            "max_operational_switch_s": MAX_OPERATIONAL_SWITCH_S,
-            "pick_start_events": list(PICK_START_EVENTS),
+            "app": APP_NAME, "version": VERSION, "native": native,
             "output_root": session.output_root,
-            "native": bool(app.state.native),
+            "defaults": {"door_s": DOOR_S_DEFAULT, "door_s_max": DOOR_S_MAX,
+                         "target_rate": TARGET_RATE_DEFAULT,
+                         "starved_s": STARVED_S_DEFAULT, "starved_s_max": STARVED_S_MAX},
         }
-
-    app.state.last_seen = 0.0
 
     @app.get("/api/state")
     def state(log_from: int = 0):
-        app.state.last_seen = time.time()
         return session.state(log_from)
 
-    @app.post("/api/files")
+    @app.post("/api/upload")
     async def upload(files: list[UploadFile] = File(...)):
         batch = os.path.join(session.upload_dir, uuid.uuid4().hex[:8])
         os.makedirs(batch, exist_ok=True)
         saved, rejected = [], []
-        # Config files first, so data files in the same batch pick them up
-        # (load_user_config looks next to the data file).
-        for f in sorted(files, key=lambda f: not (f.filename or "").lower().endswith(".json")):
+        for f in files:
             name = os.path.basename(f.filename or "upload")
-            ext = os.path.splitext(name)[1].lower()
-            if ext not in _ALLOWED_EXT:
-                rejected.append(f"{name}: unsupported file type")
+            if not name.lower().endswith(_ALLOWED_EXT):
+                rejected.append(f"{name}: not a .log or .log.gz file")
                 continue
-            dest = os.path.join(batch, "asrs_config.json" if ext == ".json" else name)
+            dest = os.path.join(batch, name)
             with open(dest, "wb") as out:
                 shutil.copyfileobj(f.file, out, length=1 << 20)
-            if ext == ".json":
-                try:
-                    with open(dest, encoding="utf-8") as fh:
-                        vr = validate_user_config(json.load(fh))
-                    if not vr.ok:
-                        rejected.append(f"{name}: " + "; ".join(vr.errors))
-                        os.remove(dest)
-                except Exception as exc:
-                    rejected.append(f"{name}: not valid JSON ({exc})")
-                    os.remove(dest)
-                continue
             saved.append(dest)
-        ids = session.add_paths(saved)
-        return {"added": ids, "rejected": rejected}
+        added, more = session.add(saved)
+        return {"added": added, "rejected": rejected + more}
 
-    @app.post("/api/files/paths")
+    @app.post("/api/paths")
     def add_paths(payload: dict = Body(...)):
         paths = [p for p in payload.get("paths", []) if isinstance(p, str)]
-        missing = [p for p in paths if not os.path.isfile(p)]
-        if missing:
-            raise HTTPException(400, f"File not found: {', '.join(missing)}")
-        return {"added": session.add_paths(paths), "rejected": []}
+        missing = [p for p in paths if not os.path.exists(p)]
+        added, rejected = session.add([p for p in paths if os.path.exists(p)])
+        return {"added": added,
+                "rejected": rejected + [f"{os.path.basename(p)}: not found" for p in missing]}
 
-    @app.post("/api/dialog/open")
+    @app.post("/api/days/remove")
+    def remove_day(payload: dict = Body(...)):
+        session.remove(payload.get("files", []))
+        return {"ok": True}
+
+    @app.post("/api/days/clear")
+    def clear_days():
+        session.clear()
+        return {"ok": True}
+
+    @app.get("/api/native-dialog")
     def native_dialog():
-        win = app.state.window
-        if win is None:
-            raise HTTPException(400, "Native file dialog is only available in the desktop window.")
-        import webview  # type: ignore
-        res = win.create_file_dialog(
+        """Open the OS file picker — only possible inside a pywebview window."""
+        try:
+            import webview
+        except ImportError:
+            raise HTTPException(400, "The native file dialog needs the desktop window.")
+        windows = getattr(webview, "windows", None)
+        if not windows:
+            raise HTTPException(400, "No desktop window is open.")
+        picked = windows[0].create_file_dialog(
             webview.OPEN_DIALOG, allow_multiple=True,
-            file_types=("ESS data files (*.xlsx;*.xlsm;*.log)", "All files (*.*)"),
+            file_types=("ESS logs (*.log;*.log.gz)", "All files (*.*)"),
         )
-        paths = list(res or [])
-        return {"added": session.add_paths(paths) if paths else [], "rejected": []}
-
-    @app.patch("/api/days/{day_id}")
-    def rename_day(day_id: str, payload: dict = Body(...)):
-        label = str(payload.get("label", "")).strip()
-        with session.lock:
-            e = session.days.get(day_id)
-            if e is None:
-                raise HTTPException(404, "Unknown day")
-            if label:
-                e.label, e.label_edited = label[:60], True
-        return {"ok": True}
-
-    @app.delete("/api/days/{day_id}")
-    def remove_day(day_id: str):
-        with session.lock:
-            session.days.pop(day_id, None)
-            session.order = [i for i in session.order if i != day_id]
-        return {"ok": True}
-
-    @app.post("/api/days/reorder")
-    def reorder(payload: dict = Body(...)):
-        ids = [i for i in payload.get("order", []) if i in session.days]
-        with session.lock:
-            session.order = ids + [i for i in session.order if i not in ids]
-        return {"ok": True}
+        added, rejected = session.add(list(picked or []))
+        return {"added": added, "rejected": rejected}
 
     @app.post("/api/run")
-    def run(payload: dict = Body(...)):
-        valid = {k for k, _ in ANALYSIS_MODULES}
-        try:
-            sw = float(payload.get("switch_s_fixed", SWITCH_S_FALLBACK))
-        except (TypeError, ValueError):
-            raise HTTPException(400, "Switch time must be a number.")
-        if not (0 <= sw <= MAX_OPERATIONAL_SWITCH_S):
-            raise HTTPException(400, f"Switch time must be between 0 and {MAX_OPERATIONAL_SWITCH_S:g} s.")
-        pse = payload.get("pick_start_event") or None
-        if pse is not None and pse not in PICK_START_EVENTS:
-            raise HTTPException(400, "Unknown pick-time start event.")
-        rates: dict[str, float] = {}
-        for ws, v in (payload.get("design_rates") or {}).items():
-            if v in (None, ""):
-                continue
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                raise HTTPException(400, f"Design rate for {ws} must be a number.")
-            if v < 0:
-                raise HTTPException(400, f"Design rate for {ws} must be positive.")
-            if v > 0:
-                rates[str(ws)] = v
-        settings = RunSettings(
-            enabled={k for k in payload.get("enabled", []) if k in valid},
-            switch_s_fixed=sw,
-            switch_mode="measured" if payload.get("switch_mode") == "measured" else "fixed",
-            pick_start_event=pse,
-            station_types={str(k): str(v).strip() for k, v in (payload.get("station_types") or {}).items()
-                           if str(v).strip()},
-            design_rates=rates,
-            excel_exports=bool(payload.get("excel_exports", True)),
-        )
-        return {"job": session.start_run(settings)}
+    def start_run(payload: dict = Body(...)):
+        s = Settings()
+        for key in ("door_s", "target_rate", "starved_s"):
+            if payload.get(key) is not None:
+                try:
+                    setattr(s, key, float(payload[key]))
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"'{key}' must be a number.")
+        nd = payload.get("no_door") or {}
+        if isinstance(nd, list):
+            nd = {str(x): True for x in nd}
+        if not isinstance(nd, dict) or not all(isinstance(v, bool) for v in nd.values()):
+            raise HTTPException(400, "'no_door' must list stations or zones without a door.")
+        s.no_door = {str(k): v for k, v in nd.items()}
+        days_off = payload.get("no_door_days") or []
+        if isinstance(days_off, dict):
+            days_off = [d for d, off in days_off.items() if off]
+        if not isinstance(days_off, list):
+            raise HTTPException(400, "'no_door_days' must be a list of dates.")
+        s.no_door_days = [str(d) for d in days_off]
+        for key, table in (("targets", s.targets), ("pick_s", s.pick_s), ("switch_s", s.switch_s)):
+            given = payload.get(key) or {}
+            if not isinstance(given, dict):
+                raise HTTPException(400, f"'{key}' must be an object of zone or station -> value.")
+            for name, val in given.items():
+                if val in (None, ""):
+                    continue
+                try:
+                    table[str(name)] = float(val)
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{key} for '{name}' must be a number.")
+        return {"job": session.start(s)}
 
     @app.post("/api/run/cancel")
-    def cancel():
+    def cancel_run():
         session.job.cancel.set()
         return {"ok": True}
 
@@ -500,65 +389,45 @@ def create_app(output_root: str | None = None, native: bool = False) -> FastAPI:
             "run_dir": r.run_dir,
             "seconds": round(r.seconds, 1),
             "warnings": r.warnings,
-            "report_url": _rel_url(r, r.html_path, root),
-            "combined_url": _rel_url(r, r.combined_path, root),
-            "summary": [_chart_meta(c, i) for i, c in enumerate(r.summary_registry)],
+            "report_url": _rel_url(r, r.report, root),
             "days": [{
-                "label": d.label, "date": d.date, "kpis": d.kpis, "failures": d.failures,
-                "exports": [{"name": os.path.basename(p), "url": _rel_url(r, p, root)}
-                            for p in d.exports if os.path.isfile(p)],
-                "charts": [_chart_meta(c, i) for i, c in enumerate(d.registry)],
+                "label": d.label,
+                "date": d.date,
+                "ok": d.ok,
+                "error": d.error,
+                "seconds": round(d.seconds, 1),
+                "headline": _headline(d),
             } for d in r.days],
         }
 
-    @app.get("/api/results/{day}/{idx}/figure")
-    def figure(day: str, idx: int):
-        r = session.result
-        if r is None:
-            raise HTTPException(404, "No results yet.")
-        reg = _registry(r, day)
-        if not 0 <= idx < len(reg):
-            raise HTTPException(404, "Unknown chart")
-        return Response(reg[idx]["figure"].to_json(), media_type="application/json")
-
-    @app.get("/api/results/{day}/{idx}/rows")
-    def rows(day: str, idx: int):
-        r = session.result
-        if r is None:
-            raise HTTPException(404, "No results yet.")
-        reg = _registry(r, day)
-        if not 0 <= idx < len(reg):
-            raise HTTPException(404, "Unknown chart")
-        from report_builder import _json_safe
-        raw = reg[idx].get("raw_data") or {}
-        return JSONResponse(_json_safe({"id": reg[idx]["id"], "rows": raw.get("rows") or [],
-                                        "meta": {k: v for k, v in raw.items() if k != "rows"}}))
-
     @app.get("/api/runs")
     def runs():
-        out = []
-        root = session.output_root
+        out, root = [], session.output_root
         if os.path.isdir(root):
             for name in sorted(os.listdir(root), reverse=True)[:50]:
-                rep = os.path.join(root, name, "asrs_analysis_report.html")
-                if os.path.isfile(rep):
-                    days = [d for d in sorted(os.listdir(os.path.join(root, name)))
-                            if os.path.isdir(os.path.join(root, name, d))]
-                    out.append({"name": name, "report_url": f"/runs/{name}/asrs_analysis_report.html",
-                                "path": os.path.join(root, name), "days": days,
-                                "modified": os.path.getmtime(rep)})
+                folder = os.path.join(root, name)
+                if not os.path.isdir(folder):
+                    continue
+                entry = os.path.join(folder, REPORT_NAME)
+                if not os.path.isfile(entry):
+                    continue
+                out.append({
+                    "name": name, "path": folder,
+                    "url": "/runs/" + urllib.parse.quote(
+                        os.path.relpath(entry, root).replace(os.sep, "/")),
+                    "modified": os.path.getmtime(entry),
+                })
         return {"root": root, "runs": out}
 
     @app.post("/api/open")
     def open_path(payload: dict = Body(...)):
-        target = payload.get("target")
-        r = session.result
+        target, r = payload.get("target"), session.result
         if target == "output_root":
             path = session.output_root
         elif target == "run_dir" and r:
             path = r.run_dir
         elif target == "report" and r:
-            path = r.html_path
+            path = r.report
         elif target == "file" and str(payload.get("url", "")).startswith("/runs/"):
             rel = urllib.parse.unquote(str(payload["url"])[len("/runs/"):])
             root = os.path.realpath(session.output_root)
@@ -569,19 +438,33 @@ def create_app(output_root: str | None = None, native: bool = False) -> FastAPI:
             path = os.path.join(session.output_root, os.path.basename(str(payload["name"])))
         else:
             raise HTTPException(400, "Nothing to open.")
-        if not os.path.exists(path):
+        if not path or not os.path.exists(path):
             raise HTTPException(404, "Path no longer exists.")
         try:
             _open_in_os(path)
         except Exception as exc:
             raise HTTPException(500, f"Could not open: {exc}")
-        return {"ok": True, "path": path}
+        return {"ok": True}
 
     return app
 
 
+def _headline(day) -> dict | None:
+    """A few numbers for the results card."""
+    m = day.metrics
+    if not m:
+        return None
+    k = m.get("robot_k50") or {}
+    return {
+        "visits": m["overall"]["visits"],
+        "stations": len(m["stations"]),
+        "op_med": m["overall"]["op_med"],
+        "multi_pct": k.get("multi_station_pct"),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Launcher
+# Launch
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _free_port() -> int:
@@ -590,63 +473,34 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _start_idle_watchdog(app: FastAPI, server, idle_s: float = 90.0) -> None:
-    """Shut the server down when no page has polled for `idle_s` seconds
-    (after the first page load) and no run is in progress."""
-    def watch() -> None:
-        while not server.should_exit:
-            time.sleep(5)
-            seen = app.state.last_seen
-            busy = app.state.session.job.status == "running"
-            if seen and not busy and time.time() - seen > idle_s:
-                server.should_exit = True
-    threading.Thread(target=watch, daemon=True, name="ess-watchdog").start()
-
-
 def launch(port: int = 0, output_root: str | None = None, mode: str = "auto") -> None:
-    """Start the UI.  mode: 'auto' (native window if possible), 'browser', 'none'."""
+    """Serve the UI and open it in a window (or the browser)."""
     import uvicorn
 
-    # A windowed (no-console) PyInstaller build has no stdout/stderr; uvicorn
-    # and print() would crash writing to them.
-    if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w")
-    if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w")
-
-    webview = None
-    if mode == "auto":
-        try:
-            import webview  # type: ignore  # noqa: F811
-        except Exception:
-            webview = None
+    try:
+        import webview
+    except ImportError:
+        webview = None
+    native = mode != "browser" and webview is not None
 
     port = port or _free_port()
-    url = f"http://127.0.0.1:{port}/"
-    app = create_app(output_root, native=webview is not None)
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
-                                           log_level="warning", access_log=False,
-                                           log_config=None))
+    url = f"http://127.0.0.1:{port}"
+    app = create_app(output_root=output_root, native=native)
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
 
-    if webview is None:
-        if mode != "none":
-            threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-            if getattr(sys, "frozen", False):
-                # No console window to Ctrl+C: stop once the page is closed.
-                _start_idle_watchdog(app, server)
-        print(f"{APP_NAME} is running at {url}  (Ctrl+C to quit)")
+    if native:
+        threading.Thread(target=server.run, daemon=True, name="ess-http").start()
+        for _ in range(100):                     # wait for the port to answer
+            if server.started:
+                break
+            time.sleep(0.05)
+        window = webview.create_window(APP_NAME, url, width=1280, height=860,
+                                       min_size=(900, 620))
+        webview.start()
+        server.should_exit = True
+        _ = window
+    else:
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        print(f"{APP_NAME} {VERSION} — {url}  (Ctrl+C to stop)")
         server.run()
-        return
-
-    t = threading.Thread(target=server.run, daemon=True, name="ess-server")
-    t.start()
-    for _ in range(100):           # wait until the server accepts connections
-        if server.started:
-            break
-        time.sleep(0.05)
-    window = webview.create_window(APP_NAME, url, width=1440, height=920,
-                                   min_size=(1024, 680), background_color="#0f1424")
-    app.state.window = window
-    webview.start()
-    server.should_exit = True
-    t.join(timeout=3)

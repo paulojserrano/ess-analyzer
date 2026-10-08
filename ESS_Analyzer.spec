@@ -5,23 +5,15 @@
 #
 #   ESS_Analyzer.exe                 → desktop UI (native window via pywebview,
 #                                      or the default browser if unavailable)
-#   ESS_Analyzer.exe day1.xlsx ...   → headless analysis (no window)
+#   ESS_Analyzer.exe day1.log.gz ... → headless analysis (no window)
 #
 # Reports are written to an "asrs_analysis_output" folder next to the .exe.
-
-import glob
-import os
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
 datas, binaries, hiddenimports = [], [], []
-
-# Plotly ships data files (validators, templates, plotly.min.js) used at runtime.
-for pkg in ("plotly", "jaraco"):
-    d, b, h = collect_all(pkg)
-    datas += d; binaries += b; hiddenimports += h
 
 # Native window (optional at runtime — skipped if not installed at build time).
 try:
@@ -30,24 +22,13 @@ try:
 except Exception:
     pass
 
-# The UI's static files.
-datas += [("webui", "webui")]
+# The UI's static files and the report templates (read at runtime by report.py).
+datas += [("webui", "webui"), ("templates", "templates")]
 
 hiddenimports += [
-    # Analysis modules are resolved with importlib (config.ANALYSIS_IMPLEMENTATIONS),
-    # so PyInstaller cannot see them through static imports.  Listed from the
-    # folder: collect_submodules() cannot import this local package.
-    *sorted("analyses." + os.path.splitext(os.path.basename(f))[0]
-            for f in glob.glob(os.path.join("analyses", "*.py"))
-            if not f.endswith("__init__.py")),
-    "log_converter",
     # Web server stack
     *collect_submodules("uvicorn"),
     "fastapi", "starlette", "multipart", "python_multipart",
-    # pandas loads the Excel engines dynamically
-    "python_calamine",
-    "openpyxl", "openpyxl.styles", "openpyxl.utils", "openpyxl.workbook",
-    "openpyxl.writer.excel", "pandas.io.formats.excel",
 ]
 
 a = Analysis(
@@ -68,8 +49,9 @@ a = Analysis(
         "IPython",
         "jupyter",
         "notebook",
-        "kaleido",
         "pytest",
+        "plotly",
+        "openpyxl",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

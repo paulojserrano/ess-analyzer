@@ -1,45 +1,50 @@
+"""Shared fixtures — synthetic log days, parsed and measured."""
 from __future__ import annotations
 
 import os
 import sys
 
-import pandas as pd
 import pytest
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests.synthetic import SynthOptions, write_workbook  # noqa: E402
-
-SMALL = dict(n_stations=4, n_robots=24, start_hour=7, end_hour=10)
+from log_parser import parse_logs      # noqa: E402
+from metrics import day_base, zones_for  # noqa: E402
+from tests.synthetic import write      # noqa: E402
 
 
 @pytest.fixture(scope="session")
-def workbook(tmp_path_factory) -> str:
-    path = tmp_path_factory.mktemp("data") / "day1.xlsx"
-    return write_workbook(str(path), SynthOptions(**SMALL))
+def log_file(tmp_path_factory):
+    return write(str(tmp_path_factory.mktemp("logs") / "play_extract_2026-10-01.log"))
 
 
 @pytest.fixture(scope="session")
-def workbook_day2(tmp_path_factory) -> str:
-    path = tmp_path_factory.mktemp("data2") / "day2.xlsx"
-    return write_workbook(str(path), SynthOptions(seed=21, day=pd.Timestamp("2026-06-13"), **SMALL))
+def log_gz(tmp_path_factory):
+    return write(str(tmp_path_factory.mktemp("logs_gz") / "play_extract_2026-10-01.log.gz"))
 
 
 @pytest.fixture(scope="session")
-def workbook_blank_create(tmp_path_factory) -> str:
-    path = tmp_path_factory.mktemp("data3") / "blank_create.xlsx"
-    return write_workbook(str(path), SynthOptions(seed=5, create_time_fill=0.0, **SMALL))
+def data(log_file):
+    return parse_logs(log_file)
 
 
 @pytest.fixture(scope="session")
-def loaded(workbook):
-    from pipeline import load_day
-    return load_day([workbook])
+def base(data):
+    return day_base(data)
 
 
 @pytest.fixture(scope="session")
-def day_data(loaded):
-    from data_loader import filter_to_peak_day
-    return filter_to_peak_day(loaded.data), loaded.cfg
+def bases(tmp_path_factory):
+    """Three days with slightly different shifts, so trends have something to show."""
+    folder = tmp_path_factory.mktemp("days")
+    out = []
+    for i, date in enumerate(("2026-10-01", "2026-10-02", "2026-10-03")):
+        p = folder / f"play_extract_{date}.log"
+        write(str(p), date=date, hours=(6, 9 + i))
+        out.append(day_base(parse_logs(str(p))))
+    return out
+
+
+@pytest.fixture(scope="session")
+def zones(bases):
+    return zones_for(bases)

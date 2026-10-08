@@ -1,112 +1,159 @@
 """
-config.py — Single source of truth for all constants and palette definitions.
+config.py — run settings and the few constants the analysis depends on.
+
+The report recalculates live in the browser, so ``door_s`` and the targets set
+here are only its starting values; they can be changed in the report itself.
 """
+from __future__ import annotations
 
-# ── Brand colours ────────────────────────────────────────────────────────────
-INK    = "#1a1a2e"
-ACCENT = "#e94560"
+import json
+import os
+import re
+from dataclasses import asdict, dataclass, field
 
-# ── Zone / station type palette (cycled when > 6 types are detected) ─────────
-AUTO_TYPE_PALETTE: list[str] = [
-    "#2563eb", "#16a34a", "#d97706", "#7c3aed", "#0891b2", "#dc2626",
-]
+# ── Door travel ───────────────────────────────────────────────────────────────
+# The shutter-door open command is issued in the same millisecond as the robot's
+# arrival, so the door's physical travel never appears in the log.  DOOR_S is
+# added to every measured release→arrival gap to give the true switch time, and
+# the same seconds are taken off the front of each visit's pick window (the door
+# is still opening, so the operator is not picking yet).  0 means "as logged".
+DOOR_S_DEFAULT = 0.0
+DOOR_S_MAX = 60.0
 
-# ── Lifecycle stage colours (one per stage, cycled if needed) ────────────────
-STAGE_COLORS: list[str] = [
-    "#f59e0b", "#16a34a", "#10b981", "#2563eb",
-    "#7c3aed", "#ec4899", "#0891b2", "#f97316",
-]
+# ── Starvation ────────────────────────────────────────────────────────────────
+# A station is "starved" on a handover when it waits for the next robot more than
+# this many seconds beyond its median handover (release → next arrival).
+STARVED_S_DEFAULT = 1.0
+STARVED_S_MAX = 600.0
 
-# ── Heatmap colour scales ────────────────────────────────────────────────────
-# Ordered single-hue sequential scale: darker always means "more" (longer time,
-# more retrievals, higher throughput).  Replaces the earlier rainbow scales,
-# whose mid-range hues (green vs yellow) had no intuitive order.
-SEQ_COLORSCALE: list[list] = [
-    [0.0, "#f4f8fd"], [0.2, "#cfe0f3"], [0.45, "#7fb0de"],
-    [0.7, "#3a7bc0"], [0.88, "#1d4f91"], [1.0, "#0c2a5b"],
-]
+# ── Targets ───────────────────────────────────────────────────────────────────
+# Totes a station is expected to present per hour.  Targets can be set per
+# station or per zone (a row of stations — see log_parser.assign_zones).  Zones
+# without an explicit target get TARGET_RATE_DEFAULT when they are a high-rate
+# zone (see HIGH_RATE_SHARE) and no target otherwise.
+TARGET_RATE_DEFAULT = 270.0
+TARGET_MAX = 10000.0
 
-# ── Chinese column-prefix → English stage label ──────────────────────────────
-STAGE_LABEL_MAP: dict[str, str] = {
-    "分配":    "Allocation wait",
-    "A42取箱": "A42 retrieve",
-    "A42放箱": "A42 deposit",
-    "K50完成": "K50 deliver + dwell",
-    "拣选":    "Picking",
-}
+# A station-hour counts as "full production" when its K50 cycles reach this
+# share of the busiest hour of the day.
+FULL_HOUR_SHARE = 0.75
+# Zones averaging at least this share of the busiest zone's presentations per
+# station-hour are "high-rate" and get the default target automatically.
+HIGH_RATE_SHARE = 0.5
+# Picks longer than this are the "tail" quoted in the budget commentary.
+LONG_PICK_S = 20.0
+# No robot reaching any station for this long is reported as an idle window.
+IDLE_MIN_MINUTES = 30
+# A robot with no task for this long is "away" (most likely charging — the log
+# has no charging events) rather than "between tasks" and available.
+AWAY_MIN_S = 300.0
+# A release→arrival gap longer than this is a stand-down, not a handover, and is
+# left out of the switch percentiles.
+MAX_SWITCH_S = 3600.0
 
-# ── Column names ─────────────────────────────────────────────────────────────
-TOTAL_DURATION_COL = "任务全程耗时(秒)"
+# ── Histogram shape (bins × width, last bin collects the tail) ────────────────
+SWITCH_HIST_BINS, SWITCH_HIST_W = 60, 0.5
+OPERATOR_HIST_BINS, OPERATOR_HIST_W = 30, 2.0
 
-# ── Switch-time model (shared by dwell, throughput, switch, summary) ─────────
-# Default robot handoff time used in implied-throughput formulas.  This is the
-# starting value for the user-configurable "switch/wait time" (set in the GUI
-# or via asrs_config.json "switch_s_fixed"); it is also the per-station fallback
-# in "measured" mode when a station has no measurable release→arrived swaps.
-# Resolved at runtime by analyses.switch_time.resolve_switch_s(cfg, station).
-SWITCH_S_FALLBACK = 6.0
-# A release→arrived gap longer than this is treated as starvation / idle time
-# (breaks, no demand, dispatch gaps) rather than an operational robot swap.
-MAX_OPERATIONAL_SWITCH_S = 300.0
+CONFIG_FILENAME = "ess_config.json"
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-# ── Pick-time start event ────────────────────────────────────────────────────
-# Pick time is normally measured from each robot's 'arrived' event to its next
-# 'triggerGo'.  Some exports are missing 'arrived' events entirely; when that
-# happens the GUI (or asrs_config.json) can fall back to 'ppReady'→'triggerGo'.
-# Resolved from cfg["pick_start_event"]; must be one of these two values.
-PICK_START_EVENT_DEFAULT = "arrived"
-PICK_START_EVENTS = ("arrived", "ppReady")
 
-# ── AMR auto-detection hint: robot type name containing this string is treated
-#    as the delivery AMR (K50 equivalent).  Override via asrs_config.json. ───
-AMR_DELIVERY_TYPE_HINT = "50"
+@dataclass
+class Settings:
+    """Everything a run can be tuned with."""
+    door_s: float = DOOR_S_DEFAULT
+    target_rate: float = TARGET_RATE_DEFAULT
+    # Per station ("LABOR-12") or per zone ("Zone B"); a station's own entry
+    # wins over its zone's.  0 means "none".
+    targets: dict[str, float] = field(default_factory=dict)    # totes per hour
+    pick_s: dict[str, float] = field(default_factory=dict)     # target pick seconds per tote
+    switch_s: dict[str, float] = field(default_factory=dict)   # target switch seconds per tote
+    # Stations (or zones) without a shutter door: True = no door.  A station's
+    # own entry wins over its zone's, so {"Zone B": True, "LABOR-9": False}
+    # means every Zone B station but LABOR-9.  Unlisted stations have a door.
+    no_door: dict[str, bool] = field(default_factory=dict)
+    # Dates ("YYYY-MM-DD") on which the doors were not in use at all.
+    no_door_days: list[str] = field(default_factory=list)
+    # Seconds beyond a station's median handover that count as starved.
+    starved_s: float = STARVED_S_DEFAULT
+    output_root: str | None = None
 
-# ── Analysis registry — order controls sidebar display and tab order ─────────
-ANALYSIS_MODULES: list[tuple[str, str]] = [
-    ("throughput", "Throughput per station / hour"),
-    ("dwell",      "Dwell / pick time"),
-    ("switch",     "Switch time & starvation"),
-    ("readiness",  "Station readiness (ppReady)"),
-    # ("cycle",      "Cycle time  (lifecycle sheet)"),  # temporarily disabled
-    ("backlog",    "Allocation wait & backlog  (lifecycle sheet)"),
-    ("retrieval",  "Retrieval demand  (lifecycle sheet)"),
-    ("fleet",      "Fleet utilisation & queue depth  (lifecycle + station)"),
-    ("robot",      "Per-robot performance"),
-    ("returns",    "Outbound vs return flow"),
-    ("efficiency", "HPS3 bottleneck attribution  (efficiency sheet)"),
-    ("quality",    "Data quality & cross-validation"),
-]
+    def validate(self) -> list[str]:
+        """Return a list of problems; empty when the settings are usable."""
+        bad: list[str] = []
+        if not 0 <= self.door_s <= DOOR_S_MAX:
+            bad.append(f"door_s must be between 0 and {DOOR_S_MAX:.0f} seconds (got {self.door_s}).")
+        if not 0 <= self.starved_s <= STARVED_S_MAX:
+            bad.append(f"starved_s must be between 0 and {STARVED_S_MAX:.0f} seconds (got {self.starved_s}).")
+        if not 1 <= self.target_rate <= TARGET_MAX:
+            bad.append(f"target_rate must be between 1 and {TARGET_MAX:.0f} (got {self.target_rate}).")
+        for name, rate in self.targets.items():
+            if not isinstance(rate, (int, float)) or not 0 <= rate <= TARGET_MAX:
+                bad.append(f"target for '{name}' must be a number between 0 and {TARGET_MAX:.0f}.")
+        bad += [f"no_door_days: '{d}' is not a date like 2026-09-25." for d in self.no_door_days
+                if not (isinstance(d, str) and _DATE_RE.match(d))]
+        for kind, table in (("pick_s", self.pick_s), ("switch_s", self.switch_s)):
+            for name, sec in table.items():
+                if not isinstance(sec, (int, float)) or not 0 <= sec <= 3600:
+                    bad.append(f"{kind} for '{name}' must be a number of seconds between 0 and 3600.")
+        return bad
 
-# Implementing module for each registry key — the pipeline imports these with
-# importlib (see pipeline.py); nothing else imports analysis modules directly.
-ANALYSIS_IMPLEMENTATIONS: dict[str, str] = {
-    "throughput": "analyses.throughput",
-    "dwell":      "analyses.dwell_time",
-    "switch":     "analyses.switch_time",
-    "readiness":  "analyses.station_readiness",
-    "cycle":      "analyses.cycle_time",
-    "backlog":    "analyses.backlog",
-    "retrieval":  "analyses.retrieval",
-    "fleet":      "analyses.fleet_utilization",
-    "robot":      "analyses.robot_performance",
-    "returns":    "analyses.return_flow",
-    "efficiency": "analyses.efficiency",
-    "quality":    "analyses.data_quality",
-}
+    def to_dict(self) -> dict:
+        return asdict(self)
 
-# Analyses that need the lifecycle sheet and are skipped without it.
-LIFECYCLE_ONLY: set[str] = {"cycle", "retrieval", "backlog"}
 
-# Preferred chart order inside a day's report.  Listed IDs come first in this
-# order; all others follow in pipeline order.
-CHART_DISPLAY_ORDER: list[str] = [
-    "throughput_total",
-    "throughput_heatmap",
-    "dwell_heatmap",
-    "switch_heatmap",
-    "dwell_pick_distribution",
-    "throughput_picker_rate",
-]
+def load_settings(folder: str, base: Settings | None = None) -> tuple[Settings, list[str]]:
+    """Merge ``ess_config.json`` from *folder* over *base*.
 
-# Analyses checked by default in the GUI
-DEFAULT_CHECKED: set[str] = {"throughput", "dwell", "switch"}
+    Returns (settings, problems).  A missing file is not a problem.
+    """
+    s = Settings(**(base.to_dict() if base else {}))
+    path = os.path.join(folder, CONFIG_FILENAME)
+    if not os.path.isfile(path):
+        return s, []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        return s, [f"{CONFIG_FILENAME} could not be read: {exc}"]
+    if not isinstance(raw, dict):
+        return s, [f"{CONFIG_FILENAME} must contain a JSON object."]
+
+    known = {"door_s", "target_rate", "starved_s", "targets", "pick_s", "switch_s", "no_door", "no_door_days"}
+    problems = [f"{CONFIG_FILENAME}: unknown setting '{k}'." for k in raw if k not in known]
+    for key in ("door_s", "target_rate", "starved_s"):
+        if key in raw:
+            try:
+                setattr(s, key, float(raw[key]))
+            except (TypeError, ValueError):
+                problems.append(f"{CONFIG_FILENAME}: '{key}' must be a number.")
+    if "no_door" in raw:
+        nd = raw["no_door"]
+        if isinstance(nd, list) and all(isinstance(x, str) for x in nd):
+            s.no_door.update({x: True for x in nd})
+        elif isinstance(nd, dict) and all(isinstance(v, bool) for v in nd.values()):
+            s.no_door.update({str(k): v for k, v in nd.items()})
+        else:
+            problems.append(f"{CONFIG_FILENAME}: 'no_door' must be a list of stations or zones, "
+                            'like ["LABOR-8", "Zone B"].')
+    if "no_door_days" in raw:
+        nd = raw["no_door_days"]
+        if isinstance(nd, list) and all(isinstance(x, str) and _DATE_RE.match(x) for x in nd):
+            s.no_door_days = sorted(set(s.no_door_days) | set(nd))
+        else:
+            problems.append(f"{CONFIG_FILENAME}: 'no_door_days' must be a list of dates like "
+                            '["2026-09-25", "2026-09-26"].')
+    for key, table in (("targets", s.targets), ("pick_s", s.pick_s), ("switch_s", s.switch_s)):
+        if key not in raw:
+            continue
+        if not isinstance(raw[key], dict):
+            problems.append(f"{CONFIG_FILENAME}: '{key}' must be an object like "
+                            '{"Zone A": 270, "LABOR-12": 80}.')
+            continue
+        for name, val in raw[key].items():
+            try:
+                table[str(name)] = float(val)
+            except (TypeError, ValueError):
+                problems.append(f"{CONFIG_FILENAME}: {key} for '{name}' must be a number.")
+    return s, problems + s.validate()

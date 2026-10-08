@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Source+Sans+3:wght@400;600&display=swap" rel="stylesheet">
+<style>
+__STYLE__
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><b>Station &amp; robot cycles</b><span id="brandSub"></span></div>
+    <nav class="nav" id="nav" aria-label="On this page"></nav>
+    <a class="navset" id="settingsLink" href="#settings"><span>Settings</span><small id="navSettings"></small></a>
+    <div class="side-foot"><span id="generated"></span><button class="linkbtn" id="themeBtn" type="button">Dark</button></div>
+  </aside>
+  <div class="main">
+    <header class="bar">
+      <div><h1 id="viewTitle"></h1><p id="viewSub"></p></div>
+      <div class="controls">
+        <span class="badge" id="modified" hidden>Changed from run defaults</span>
+        <div class="datesw" role="group" aria-label="Choose a day">
+          <button class="btn icon" id="prevDay" type="button" aria-label="Previous day">&#8249;</button>
+          <select id="dateSel" aria-label="Day"></select>
+          <button class="btn icon" id="nextDay" type="button" aria-label="Next day">&#8250;</button>
+        </div>
+      </div>
+    </header>
+    <main id="view"></main>
+  </div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script>
+const REPORT=__DATA__;
+</script>
+<script>
+__ENGINE__
+</script>
+<script>
+__APP__
+</script>
+</body>
+</html>
