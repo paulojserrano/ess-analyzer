@@ -1,4 +1,4 @@
-# Python Modules Map (generated 2026-10-07)
+# Python Modules Map (generated 2026-10-08)
 # Root-level modules: classes, methods, top-level functions
 
 ## app.py  (136 lines)
@@ -10,7 +10,7 @@
      def run_headless                 (args: argparse.Namespace)
      def main                         (argv: list[str] | None = None)
 
-## config.py  (159 lines)
+## config.py  (164 lines)
    config.py — run settings and the few constants the analysis depends on.
 
    class Settings
@@ -20,7 +20,7 @@
    Top-level functions:
      def load_settings                (folder: str, base: Settings | None = None)
 
-## log_parser.py  (457 lines)
+## log_parser.py  (501 lines)
    log_parser.py — read Hairobotics "play_extract" application logs into native frames.
 
    class LogError(ValueError)
@@ -47,7 +47,7 @@
      def station_points               (arrivals: pd.DataFrame)
      def scan_stations                (path: str, settle: int = 2000, limit: int = 200_000)
 
-## metrics.py  (1399 lines)
+## metrics.py  (1790 lines)
    metrics.py — everything about one day that does not depend on the report's
 
    Top-level functions:
@@ -64,9 +64,12 @@
      def _arrivals_by_robot           (data: LogData)
      def k50_cycles                   (data: LogData)
      def _cycle_metrics               (data: LogData, day: pd.Timestamp, cycles: pd.DataFrame)
+     def _k50_time                    (data: LogData, day: pd.Timestamp, cycles: pd.DataFrame, f...)
+     def _disabled                    (data: LogData)
      def _multi_station               (v: pd.DataFrame, ho: pd.DataFrame, full: list[int])
      def _travel_hist                 (seconds)
      def _bands                       (values: np.ndarray, bands, rows: pd.DataFrame)
+     def _closed_summary              (closed: pd.DataFrame, full: list[int])
      def _busy_intervals              (data: LogData, moves: pd.DataFrame)
      def _sweep                       (start_s: np.ndarray, end_s: np.ndarray)
      def _day_seconds                 (ts: pd.Series, day: pd.Timestamp)
@@ -81,6 +84,11 @@
      def _with_alloc                  (moves: pd.DataFrame, data: LogData, robots: set[str])
      def _crowding                    (trips: pd.DataFrame, day: pd.Timestamp)
      def _spatial                     (data: LogData, day: pd.Timestamp, cycles: pd.DataFrame | ...)
+     def _repeat                      (g: pd.DataFrame, key: str, other: str)
+     def _faults                      (data: LogData, day: pd.Timestamp)
+     def _speed                       (df: pd.DataFrame, col: str, by)
+     def _fault_kind                  (kind: pd.Series, message: pd.Series)
+     def _robots                      (data: LogData, day: pd.Timestamp, cycles: pd.DataFrame | ...)
      def _full_hours                  (hourly: list[dict] | None)
      def _idle_window                 (arrivals: pd.Series, day: pd.Timestamp)
      def day_base                     (data: LogData, starved_s: float = STARVED_S_DEFAULT)

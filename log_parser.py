@@ -17,6 +17,14 @@ Lines we keep
     CALLBACK_OF_TASK_ALLOCATED           robot assigned a task      → busy from here
     "wmsTask[…]: ND… is created … destinationCodes: [LABOR-N]"
                                          the warehouse system creates a task → supply
+    CALLBACK_OF_TASK_EXCEPTION           a task cannot run; message DISABLED_TARGET
+                                         means its destination station is disabled
+    CALLBACK_OF_LOCATION_ABNORMAL        a load / unload at a slot failed too often
+    CALLBACK_OF_TOTE_LOAD_FAILED         a robot could not take the tote from a slot
+    CALLBACK_OF_TASK_SUSPENDED           a robot stopped mid-task (e.g. could not put the tote)
+    CALLBACK_OF_ROBOT_ABNORMAL           a robot fault (chassis, lift, box dropped, …)
+    CALLBACK_OF_TASK_CANCELLED           a task cancelled
+                                         → faults, by location and robot
 
 ``CALLBACK_OF_TASK_FINISHED`` fires in the same millisecond as the arrival, so it
 is *not* the operator release — only the "will leave" line is.
@@ -28,6 +36,9 @@ Output (`LogData`)
     tote_events  ts, kind (load/unload), robot, tote, loc, task
     allocations  ts, robot, task, station   (station = the K50's destination)
     created      ts, task, dest
+    exceptions   ts, task, message
+    faults       ts, kind (abnormal/load_failed/suspended/robot_abnormal/cancelled),
+                 loc, tote, robot, task, message
     moves        robot, tote, t_load, t_unload, from_loc, to_loc, task
     roles        {robot: "K50" | "ACR"}
 
@@ -69,7 +80,15 @@ _EV_REACH = "CALLBACK_OF_ROBOT_REACH_STATION"
 _EV_LOAD = "CALLBACK_OF_TOTE_LOADED_BY_ROBOT"
 _EV_UNLOAD = "CALLBACK_OF_TOTE_UNLOADED_BY_ROBOT"
 _EV_ALLOC = "CALLBACK_OF_TASK_ALLOCATED"
-_WANTED = (_EV_REACH, _EV_LOAD, _EV_UNLOAD, _EV_ALLOC)
+_EV_EXCEPTION = "CALLBACK_OF_TASK_EXCEPTION"
+# Fault events, kept by location: the kind each becomes in LogData.faults.
+_FAULTS = {"CALLBACK_OF_LOCATION_ABNORMAL": "abnormal", "CALLBACK_OF_TOTE_LOAD_FAILED": "load_failed",
+           "CALLBACK_OF_TASK_SUSPENDED": "suspended", "CALLBACK_OF_ROBOT_ABNORMAL": "robot_abnormal",
+           "CALLBACK_OF_TASK_CANCELLED": "cancelled"}
+_WANTED = (_EV_REACH, _EV_LOAD, _EV_UNLOAD, _EV_ALLOC, _EV_EXCEPTION) + tuple(_FAULTS)
+
+# A task exception with this message: the task's destination station is disabled.
+DISABLED_TARGET = "DISABLED_TARGET"
 
 # Buffer location tokens — which fleet stages totes at which buffer.
 BUFFER_K50 = "coop_haiflex"
@@ -83,6 +102,9 @@ ROLE_ACR = "ACR"
 STATION_PREFIX = "LABOR"
 
 LOG_SUFFIXES = (".log", ".log.gz")
+
+
+_FAULT_COLS = ["ts", "kind", "loc", "tote", "robot", "task", "message"]
 
 
 class LogError(ValueError):
@@ -161,6 +183,8 @@ class LogData:
     skipped_stations: dict[str, int] = field(default_factory=dict)
     allocations: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=["ts", "robot", "task", "station"]))
     created: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=["ts", "task", "dest"]))
+    exceptions: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=["ts", "task", "message"]))
+    faults: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=_FAULT_COLS))
 
     @property
     def source(self) -> str:
@@ -244,7 +268,7 @@ def _roles(callbacks: list[dict]) -> dict[str, str]:
     seen: set[str] = set()
     for c in callbacks:
         robot = c.get("robotCode")
-        if not robot or c["_code"] == _EV_ALLOC:
+        if not robot or c["_code"] in (_EV_ALLOC, _EV_EXCEPTION) or c["_code"] in _FAULTS:
             continue
         seen.add(robot)
         if (c["_code"] == _EV_REACH
@@ -312,12 +336,24 @@ def parse_logs(paths: str | list[str]) -> LogData:
 
     roles = _roles(callbacks)
 
-    arr_rows, move_rows, alloc_rows = [], [], []
+    arr_rows, move_rows, alloc_rows, exc_rows, fault_rows = [], [], [], [], []
     for c in callbacks:
         code = c["_code"]
         task = c.get("taskCode", "")
         if isinstance(task, list):
             task = task[0] if task else ""
+        if code in _FAULTS:
+            fault_rows.append({"_ts": c["_ts"], "kind": _FAULTS[code], "loc": str(c.get("locationCode", "") or ""),
+                               "tote": str(c.get("containerCode", "") or ""), "robot": str(c.get("robotCode", "") or ""),
+                               "task": str(c.get("taskCode", "") or c.get("sysTaskCode", "") or ""),
+                               "message": str(c.get("message", "") or c.get("failedReason", "") or "")})
+            continue
+        if code == _EV_EXCEPTION:
+            # taskCode is a list here; one exception can name several tasks.
+            tasks = c.get("taskCode") or []
+            for t in (tasks if isinstance(tasks, list) else [tasks]):
+                exc_rows.append({"_ts": c["_ts"], "task": str(t), "message": str(c.get("message", "") or "")})
+            continue
         if code == _EV_ALLOC:
             if c.get("robotCode"):
                 alloc_rows.append({"_ts": c["_ts"], "robot": c["robotCode"], "task": str(task or ""),
@@ -368,10 +404,18 @@ def parse_logs(paths: str | list[str]) -> LogData:
     created.insert(0, "ts", _ts(created.pop("_ts")))
     created = created.dropna(subset=["ts"]).sort_values("ts", kind="stable").reset_index(drop=True)
 
+    exceptions = pd.DataFrame(exc_rows, columns=["_ts", "task", "message"])
+    exceptions.insert(0, "ts", _ts(exceptions.pop("_ts")))
+    exceptions = exceptions.dropna(subset=["ts"]).sort_values("ts", kind="stable").reset_index(drop=True)
+
+    faults = pd.DataFrame(fault_rows, columns=["_ts"] + _FAULT_COLS[1:])
+    faults.insert(0, "ts", _ts(faults.pop("_ts")))
+    faults = faults.dropna(subset=["ts"]).sort_values("ts", kind="stable").reset_index(drop=True)
+
     data = LogData(arrivals=arrivals, releases=releases, tote_events=tote_events,
                    moves=pair_moves(tote_events), roles=roles,
                    paths=list(paths), skipped_stations=skipped, allocations=allocations,
-                   created=created)
+                   created=created, exceptions=exceptions, faults=faults)
     _log.info("%s: %s arrivals, %s releases, %s tote moves, %s robots",
               data.source, f"{len(arrivals):,}", f"{len(releases):,}",
               f"{len(data.moves):,}", f"{len(roles):,}")

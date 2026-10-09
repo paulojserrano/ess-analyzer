@@ -366,3 +366,70 @@ def test_spatial_pools_days(tmp_path, report):
     text = out["summary"]["text"]["spatial"]
     assert text["sources"] and text["crowd"] and text["returns"]
     assert out["derived"][0]["text"]["spatial"]["sources"]
+
+
+def test_cycle_time_pools_days(tmp_path, report):
+    from tests.synthetic import ALLOC_LEAD_S, POST_S
+    out = run_engine(tmp_path, report)
+    days = [D["k50_time"] for D in out["derived"]]
+    S = out["summary"]["k50_time"]
+    assert S["n"] == sum(d["n"] for d in days) == sum(b["k50_time"]["n"] for b in report["days"])
+    seg = {x["key"]: x for x in S["segments"]}
+    assert sum(x["pct"] for x in S["segments"]) == pytest.approx(100, abs=0.5)
+    assert seg["fetch"]["per_cycle_s"] == pytest.approx(ALLOC_LEAD_S, abs=0.1)
+    assert seg["travel"]["per_cycle_s"] == pytest.approx(PRE_S, abs=0.1)
+    assert seg["return"]["per_cycle_s"] == pytest.approx(POST_S, abs=0.1)
+    # No queueing in the synthetic day, so taking it out changes nothing.
+    assert seg["queue"]["pct"] == 0 and S["rate_no_queue"] == S["rate_on_task"]
+    assert S["rate_on_task"] == pytest.approx(3600 / S["cycle_s"], rel=0.01)
+    assert out["summary"]["text"]["k50_time"] and out["derived"][0]["text"]["k50_time"]
+    assert any(r["k50_queue_pct"] is not None for r in out["summary"]["headline"])
+
+
+def test_starvation_by_pick_and_closures_pool(tmp_path, report):
+    out = run_engine(tmp_path, report)
+    S = out["summary"]["starve"]
+    assert sum(x["n"] for x in S["pick"]["bands"]) == S["handovers"]
+    assert S["pick"]["fast_n"] + S["pick"]["steady_n"] <= S["handovers"]
+    assert S["refill"]["n"] == sum(sum(b["starve"]["refill_hist"]) for b in report["days"])
+    assert S["closed"]["n"] == 0 and S["closed"]["hold_s"] > 0
+    assert all("closed" in h for h in S["hourly"])
+    assert "picks" in out["summary"]["text"]["starve"]
+
+
+def test_average_switch_by_station_and_hour(tmp_path, report):
+    for door in (0.0, 2.0):
+        out = run_engine(tmp_path, report, door=door)
+        for day, D in zip(report["days"], out["derived"]):
+            for s, st in enumerate(day["stations"]):
+                grid, gaps = D["hm_sw_mean"][s], day["raw"]["gap"][s]
+                n = [len(g) for g in gaps]
+                assert all((g is None) == (k == 0) for g, k in zip(grid, n))
+                # Each cell: the hour's gaps (deciseconds) as seconds, plus the door.
+                for g, gs in zip(grid, gaps):
+                    if gs:
+                        assert g == pytest.approx(sum(gs) / 10 / len(gs) + door, abs=0.051)
+                # Weighted by handovers, the hours give back the station's own mean
+                # (both are rounded to 0.1 s, hence the tolerance).
+                pooled = sum((g or 0) * k for g, k in zip(grid, n)) / sum(n)
+                assert pooled == pytest.approx(_station(D, st)["sw_mean"], abs=0.1)
+                assert min(g for g in grid if g is not None) >= SWITCH_S + door - 0.01
+        S = out["summary"]
+        assert len(S["hm_sw_mean"]) == len(S["stations"]) and all(len(r) == 24 for r in S["hm_sw_mean"])
+        # Pooled over days = Σ seconds ÷ Σ handovers.
+        st, h = S["stations"][0], 7
+        num_, den = 0.0, 0
+        for day, D in zip(report["days"], out["derived"]):
+            s = day["stations"].index(st)
+            k = len(day["raw"]["gap"][s][h])
+            if k:
+                num_ += D["hm_sw_mean"][s][h] * k; den += k
+        assert S["hm_sw_mean"][0][h] == pytest.approx(num_ / den, abs=0.1)
+
+
+def test_binomial_tail(tmp_path):
+    out = subprocess.run([NODE, "-e", f"const E=require({json.dumps(ENGINE)});"
+                          "process.stdout.write(JSON.stringify([E.binomTail(5,10,0.5),E.binomTail(0,4,0.2),E.binomTail(3,3,0.5)]))"],
+                         capture_output=True, text=True, check=True)
+    a, b, c = json.loads(out.stdout)
+    assert a == pytest.approx(638 / 1024) and b == 1 and c == pytest.approx(0.125)

@@ -201,10 +201,14 @@
     const stationSwitch = p.gapStation.map((a, s) => ({
       med: r(sw(quantile(a, 0.5), doorOf[s])), mean: a.length ? r(p.gapSum[s] / 10 / a.length + doorOf[s]) : null, p90: r(sw(quantile(a, 0.9), doorOf[s])), gt10: r(gt10(a, doorOf[s])),
     }));
-    const hmSwMed = [], hmSwGt10 = [];
+    const hmSwMed = [], hmSwGt10 = [], hmSwMean = [], swSum = [];
     for (let s = 0; s < S; s++) {
       hmSwMed.push(day.raw.gap[s].map((a) => (a.length ? r(sw(quantile(a, 0.5), doorOf[s])) : null)));
       hmSwGt10.push(day.raw.gap[s].map((a) => (a.length ? r(gt10(a, doorOf[s]), 0) : null)));
+      // Mean switch: the hour's gaps (deciseconds) plus the station's own door on each.
+      const sums = day.raw.gap[s].map((a) => a.reduce((t, g) => t + g, 0) / 10 + a.length * doorOf[s]);
+      swSum.push(sums);
+      hmSwMean.push(day.raw.gap[s].map((a, h) => (a.length ? r(sums[h] / a.length) : null)));
     }
 
     // the hour budget with the door moved from picking to the switch
@@ -261,14 +265,19 @@
       door, no_door: door > 0 ? noDoor : [],          // stations that would have had a door added
       door_day_off: dayOff && doorSet > 0,
       overall, hist_sw: hist, stations: stationRows,
-      hm_sw_med: hmSwMed, hm_sw_gt10: hmSwGt10, hm_util: hmUtil, hm_possible: hmPossible,
+      hm_sw_med: hmSwMed, hm_sw_mean: hmSwMean, hm_sw_gt10: hmSwGt10, hm_util: hmUtil, hm_possible: hmPossible,
       budget,
     };
     Object.defineProperty(out, "_pick", { value: pick, enumerable: false });
+    // Switch seconds per station-hour (door included), so the summary can pool days exactly.
+    Object.defineProperty(out, "_swSum", { value: swSum, enumerable: false });
     out.hours = hourPoints(day, out);
     out.relations = relations(out.hours);
     out.multi = day.multi ? multiStats([day.multi], [day.robot_k50 && day.robot_k50.stations_hist]) : null;
     out.starve = day.starve ? starveStats([day.starve]) : null;
+    out.k50_time = day.k50_time ? cycleTimeStats([day.k50_time]) : null;
+    out.faults = day.faults ? faultStats([day.faults]) : null;
+    out.robots = day.robots ? robotStats([day.robots], [day.faults]) : null;
     out.spatial = day.spatial ? spatialStats([day.spatial]) : null;
     out.text = dayText(day, out, C);
     out.method = methodNotes(day, out, C);
@@ -601,6 +610,8 @@
     return hist.length * w;
   }
   const addInto = (a, b) => { b.forEach((x, i) => { a[i] = (a[i] || 0) + (x || 0); }); return a; };
+  // Picks this short or shorter are "fast"; picks in this range are "steady".
+  const FAST_PICK_S = 6, STEADY_PICK_S = [12, 30];
 
   /**
    * Pool the starvation blocks of one or more days (metrics._starvation):
@@ -612,7 +623,7 @@
     const pct = (a, b) => (b ? r((a / b) * 100) : null);
     const sumOf = (f) => blocks.reduce((a, b) => a + (f(b) || 0), 0);
     const handovers = sumOf((b) => b.handovers), starved = sumOf((b) => b.starved), wait = sumOf((b) => b.wait_s);
-    const W = blocks[0].travel_w;
+    const W = blocks[0].travel_w, RW = blocks[0].refill_w || 1;
 
     const stages = STARVE_STAGES.map((st) => {
       const sec = sumOf((b) => b.stages[st.key]), at = sumOf((b) => b.starved_at[st.key]);
@@ -634,18 +645,26 @@
 
     const bands = (key) => blocks[0][key].map((bd, i) => {
       const n = sumOf((b) => b[key][i].n), st = sumOf((b) => b[key][i].starved), w = sumOf((b) => b[key][i].wait_s);
-      return { band: bd.band, n, starved: st, starved_pct: pct(st, n), wait_per_s: n ? r(w / n, 2) : null };
+      return { band: bd.band, n, starved: st, starved_pct: pct(st, n), wait_s: r(w), wait_per_s: n ? r(w / n, 2) : null };
     });
 
     const byStation = {};
     for (const b of blocks) for (const x of b.stations) {
-      const t = byStation[x.station] || (byStation[x.station] = { station: x.station, handovers: 0, starved: 0, wait: 0, stages: {}, dispatch: 0, none: 0, travel: [], en_n: [], en_s: [], created: 0, hours: 0 });
+      const t = byStation[x.station] || (byStation[x.station] = { station: x.station, handovers: 0, starved: 0, wait: 0, stages: {}, dispatch: 0, none: 0, travel: [], en_n: [], en_s: [], created: 0, hours: 0, refill: [], pick: [], closed_n: 0, closed_s: 0 });
       t.handovers += x.handovers; t.starved += x.starved; t.wait += x.wait_s || 0;
       for (const st of STARVE_STAGES) t.stages[st.key] = (t.stages[st.key] || 0) + (x.stages[st.key] || 0);
       t.dispatch += x.starved_dispatch; t.none += x.starved_none_en_route;
       addInto(t.travel, x.travel_hist); addInto(t.en_n, x.en_route_n); addInto(t.en_s, x.en_route_starved);
       t.created += x.created; t.hours += b.full_hours;
+      if (x.refill_hist) addInto(t.refill, x.refill_hist);
+      if (x.pick) x.pick.forEach((bd, i) => { const p = t.pick[i] || (t.pick[i] = { n: 0, starved: 0 }); p.n += bd.n; p.starved += bd.starved; });
+      t.closed_n += x.closed_n || 0; t.closed_s += x.closed_wait_s || 0;
     }
+    // Picks under FAST_PICK_S against steady ones (STEADY_PICK_S), by the bands' own edges.
+    const edges = blocks[0].pick_edges || [];
+    const fastIdx = edges.map((e, i) => (e[1] <= FAST_PICK_S ? i : -1)).filter((i) => i >= 0);
+    const steadyIdx = edges.map((e, i) => (e[0] >= STEADY_PICK_S[0] && e[1] <= STEADY_PICK_S[1] ? i : -1)).filter((i) => i >= 0);
+    const pickGroup = (bands, idx) => idx.reduce((a, i) => ({ n: a.n + (bands[i] ? bands[i].n : 0), starved: a.starved + (bands[i] ? bands[i].starved : 0), wait: a.wait + ((bands[i] && bands[i].wait_s) || 0) }), { n: 0, starved: 0, wait: 0 });
     const stations = Object.values(byStation).sort((a, b) => natural(a.station, b.station)).map((t) => {
       // The station's usual pipeline: the median K50s on the way at a release.
       const typical = histQuantile(t.en_n, 1, 0.5);
@@ -662,6 +681,10 @@
         starved_pct_low: pct(lowS, lowN), starved_pct_high: pct(hiS, hiN), low_share: pct(lowN, lowN + hiN),
         low_n: lowN, low_starved: lowS, high_n: hiN, high_starved: hiS,
         created_per_h: t.hours ? r(t.created / t.hours) : null,
+        refill_med: t.refill.length ? r(histQuantile(t.refill, RW, 0.5), 0) : null,
+        starved_pct_fast_pick: pct(pickGroup(t.pick, fastIdx).starved, pickGroup(t.pick, fastIdx).n),
+        starved_pct_steady_pick: pct(pickGroup(t.pick, steadyIdx).starved, pickGroup(t.pick, steadyIdx).n),
+        closed_n: t.closed_n, closed_h: r(t.closed_s / 3600, 2),
       };
     });
 
@@ -670,8 +693,29 @@
       return {
         h, handovers: xs.reduce((a, x) => a + x.handovers, 0), starved: xs.reduce((a, x) => a + x.starved, 0),
         stages: Object.fromEntries(STARVE_STAGES.map((st) => [st.key, r(xs.reduce((a, x) => a + (x.stages[st.key] || 0), 0) / 3600, 2)])),
+        closed: r(xs.reduce((a, x) => a + (x.closed_s || 0), 0) / 3600, 2),
       };
     });
+
+    let pick = null, refill = null, closed = null;
+    if (blocks.every((b) => b.pick)) {
+      const bandsP = bands("pick").map((x, i) => ({ ...x, lo: edges[i][0], hi: edges[i][1] }));
+      const fast = pickGroup(bandsP, fastIdx), steady = pickGroup(bandsP, steadyIdx);
+      pick = {
+        bands: bandsP, fast_s: FAST_PICK_S, steady_s: STEADY_PICK_S,
+        fast_n: fast.n, fast_share: pct(fast.n, handovers), fast_starved_pct: pct(fast.starved, fast.n), fast_wait_share: pct(fast.wait, wait),
+        steady_n: steady.n, steady_starved_pct: pct(steady.starved, steady.n),
+      };
+      const h = hist("refill_hist");
+      const n = h.reduce((a, b) => a + b, 0);
+      refill = { n, hist: h, w: RW, pick_max_s: blocks[0].refill_pick_max_s,
+        med: n ? r(histQuantile(h, RW, 0.5), 1) : null, p25: n ? r(histQuantile(h, RW, 0.25), 1) : null, p75: n ? r(histQuantile(h, RW, 0.75), 1) : null };
+    }
+    if (blocks.every((b) => b.closed)) {
+      const c = (k) => sumOf((b) => b.closed[k]);
+      closed = { n: c("n"), held: c("held"), disabled: c("disabled"), n_full: c("n_full"),
+        wait_h: r(c("wait_s") / 3600, 1), wait_h_full: r(c("wait_s_full") / 3600, 1), hold_s: blocks[0].closed.hold_s };
+    }
 
     return {
       days: blocks.length, starved_s: blocks[0].starved_s, travel_w: W,
@@ -680,7 +724,7 @@
       free_k50_avg: starved ? r(sumOf((b) => b.free_k50_sum) / starved, 1) : null,
       ready_here_avg: starved ? r(sumOf((b) => b.ready_here_sum) / starved, 1) : null,
       travel: { med: tq(tAll, 0.5), p90: tq(tAll, 0.9), starved_med: tq(tSt, 0.5), other_med: tq(tOt, 0.5), empty_med: tq(tEm, 0.5), empty_p90: tq(tEm, 0.9), hist: tAll },
-      pace: bands("pace"), resume: bands("resume"), stations, hourly,
+      pace: bands("pace"), resume: bands("resume"), stations, hourly, pick, refill, closed,
     };
   }
 
@@ -690,6 +734,8 @@
     const out = {}, st = Object.fromEntries(S.stages.map((x) => [x.key, x]));
     const top = S.stages.filter((x) => x.pct).sort((a, b) => b.pct - a.pct);
     const parts = [`Stations ${scope} waited ${f1(S.wait_h)} h for robots in the full-production hours, and ${f1(S.starved_pct)}% of handovers were starved (over ${secs(S.starved_s)} s beyond a normal handover).`];
+    const cl = S.closed;
+    if (cl && cl.n) parts.push(`Not counted as starvation: ${cl.n.toLocaleString()} handovers after a station was closed — its robot held there over ${f0(cl.hold_s / 60)} minutes, a break or shift change (${cl.held.toLocaleString()}) — or disabled (${cl.disabled.toLocaleString()}). They hold ${f1(cl.wait_h)} h of gaps, ${f1(cl.wait_h_full)} h of it in full-production hours.`);
     if (top.length) {
       const t = top[0];
       parts.push(`For ${f0(t.pct)}% of those waiting seconds the robot that finally arrived was at the stage "${t.label.toLowerCase()}" — ${t.note}.` +
@@ -735,6 +781,406 @@
     if (first.n && settled.n)
       tp.push(`In the first five minutes after a station comes back from a stand-down, ${f1(first.starved_pct)}% of handovers starved, against ${f1(settled.starved_pct)}% once it had been running over an hour.`);
     out.patterns = tp.join(" ");
+
+    const pk = [], P = S.pick, R = S.refill;
+    if (P && P.fast_n && P.steady_n) {
+      pk.push(`After a pick under ${P.fast_s} s, ${f1(P.fast_starved_pct)}% of handovers starved, against ${f1(P.steady_starved_pct)}% after a pick of ${P.steady_s[0]}–${P.steady_s[1]} s.`);
+      pk.push(`${f0(P.fast_share)}% of handovers followed a pick under ${P.fast_s} s, and they hold ${f0(P.fast_wait_share)}% of the waiting.`);
+    }
+    if (R && R.n && R.med) {
+      pk.push(`When a station starved after a pick under ${f0(R.pick_max_s)} s, the next robot arrived a median ${f0(R.med)} s after the previous one (middle half ${f0(R.p25)}–${f0(R.p75)} s): that is how soon a robot gets in when none is already waiting at the station — ${f0(3600 / R.med)} totes an hour at that spacing.`);
+      if (P && P.fast_starved_pct != null && P.steady_starved_pct != null && P.fast_starved_pct >= 2 * P.steady_starved_pct)
+        pk.push("Operators who pick faster than that outrun the robot arriving behind them: the station waits even though robots carrying its totes are on their way.");
+    }
+    out.picks = pk.join(" ");
+    return out;
+  }
+
+  // ── where a K50 cycle's time goes ────────────────────────────────────────
+  const K50_SEGMENTS = [
+    { key: "fetch", label: "Fetch", note: "allocation → buffer pickup: driving empty to the tote" },
+    { key: "travel", label: "Travel", note: "buffer pickup → station at the free-flow pace for that station and buffer aisle" },
+    { key: "queue", label: "Queueing", note: "the rest of pickup → arrival: carrying the tote, waiting its turn for the station" },
+    { key: "at_station", label: "At the station", note: "first arrival → last release, transit between stations of a multi-station cycle included" },
+    { key: "return", label: "Return", note: "last release → tote back in the buffer" },
+  ];
+
+  /** Pool the K50 cycle-time blocks of one or more days (metrics._k50_time). */
+  function cycleTimeStats(blocks) {
+    blocks = blocks.filter(Boolean);
+    if (!blocks.length) return null;
+    const pct = (a, b) => (b ? r((a / b) * 100) : null);
+    const sumOf = (f) => blocks.reduce((a, b) => a + (f(b) || 0), 0);
+    const n = sumOf((b) => b.n), W = blocks[0].queue_w;
+    const segOf = (bs, key) => bs.reduce((a, b) => a + (b.segments[key] || 0), 0);
+    const split = (bs, count) => {
+      const tot = K50_SEGMENTS.reduce((a, sg) => a + segOf(bs, sg.key), 0);
+      const q = segOf(bs, "queue");
+      return {
+        total_s: tot, cycle_s: count ? r(tot / count) : null,
+        rate_on_task: tot ? r((count * 3600) / tot, 2) : null,
+        rate_no_queue: tot > q ? r((count * 3600) / (tot - q), 2) : null,
+        segments: K50_SEGMENTS.map((sg) => { const v = segOf(bs, sg.key); return { ...sg, hours: r(v / 3600, 1), per_cycle_s: count ? r(v / count) : null, pct: pct(v, tot) }; }),
+      };
+    };
+    const all = split(blocks, n);
+    const hist = (key) => blocks.reduce((a, b) => addInto(a, b[key]), []);
+    const qh = hist("queue_hist"), ch = hist("carry_hist"), th = hist("travel_hist");
+    const byStation = {};
+    for (const b of blocks) for (const x of b.stations) {
+      const t = byStation[x.station] || (byStation[x.station] = { station: x.station, n: 0, multi: 0, parts: [] });
+      t.n += x.n; t.multi += x.multi; t.parts.push(x);
+    }
+    const stations = Object.values(byStation).sort((a, b) => natural(a.station, b.station)).map((t) => {
+      const sp = split(t.parts, t.n);
+      return { station: t.station, n: t.n, multi_pct: pct(t.multi, t.n), cycle_s: sp.cycle_s, rate_on_task: sp.rate_on_task, rate_no_queue: sp.rate_no_queue,
+        per_cycle: Object.fromEntries(sp.segments.map((x) => [x.key, x.per_cycle_s])), pct: Object.fromEntries(sp.segments.map((x) => [x.key, x.pct])) };
+    });
+    return {
+      days: blocks.length, n, multi: sumOf((b) => b.multi), no_alloc: sumOf((b) => b.no_alloc),
+      robots: r(mean(blocks.map((b) => b.robots)), 0), free_flow_q: blocks[0].free_flow_q, free_flow_min_n: blocks[0].free_flow_min_n, queue_w: W,
+      ...all, queue: { med: r(histQuantile(qh, W, 0.5), 0), p90: r(histQuantile(qh, W, 0.9), 0), hist: qh },
+      carry_med: r(histQuantile(ch, W, 0.5), 0), travel_med: r(histQuantile(th, W, 0.5), 0), stations,
+    };
+  }
+
+  /** The cycle-time reading in words — the same for a day or a run. */
+  function cycleTimeText(C, scope) {
+    if (!C || !C.n) return "";
+    const s = Object.fromEntries(C.segments.map((x) => [x.key, x]));
+    const parts = [`A K50 cycle ${scope} took ${f0(C.cycle_s)} s on average from allocation to the tote's return to the buffer (full-production hours). ` +
+      `${f0(s.queue.pct)}% of that was queueing — the tote picked up and waiting its turn for the station: a median ${f0(C.queue.med)} s a cycle, 10% over ${f0(C.queue.p90)} s. ` +
+      `Travel took ${f0(s.travel.pct)}%, the return ${f0(s.return.pct)}%, fetching the tote ${f0(s.fetch.pct)}% and the station itself ${f0(s.at_station.pct)}%.`];
+    parts.push(`That is ${f1(C.rate_on_task)} cycles per robot-hour on a task; without the queueing the same cycles would take ${f1(C.rate_no_queue)} an hour.`);
+    if (s.queue.pct >= 20) {
+      parts.push("The K50s are not slow — they are waiting for the stations. Their cycle rate is set by how fast the stations take totes and by how many K50s each station holds (see Station slots).");
+      parts.push("Compare with \"Robots on the way\" under Starvation: where starvation stays flat as more K50s are assigned, the extra robots only add to the queue.");
+    }
+    const ranked = C.stations.filter((x) => x.n >= 100 && x.pct.queue != null).sort((a, b) => b.pct.queue - a.pct.queue);
+    if (ranked.length >= 3) parts.push(`Queueing is the largest share at ${runs(ranked.slice(0, 2).map((x) => x.station))} (${ranked.slice(0, 2).map((x) => f0(x.pct.queue) + "%").join(", ")}) and the smallest at ${ranked[ranked.length - 1].station} (${f0(ranked[ranked.length - 1].pct.queue)}%).`);
+    return parts.join(" ");
+  }
+
+  // ── problem locations ───────────────────────────────────────────────────
+  // A slot or robot is read only with this many pickups; a heatmap cell with fewer is blank.
+  const FAULT_SLOT_MIN_N = 20, FAULT_ROBOT_MIN_N = 50, FAULT_CELL_MIN_N = 10;
+  // Significance: a one-sided binomial test against the run's flag rate,
+  // Bonferroni-corrected for the number of slots (or robots) tested.
+  const FAULT_ALPHA = 0.05;
+
+  /** log Γ(x), Lanczos approximation (g = 7). */
+  function logGamma(x) {
+    const c = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059,
+      12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+    if (x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - logGamma(1 - x);
+    x -= 1;
+    let a = c[0];
+    const t = x + 7.5;
+    for (let i = 1; i < 9; i++) a += c[i] / (x + i);
+    return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+  }
+  /** P(X ≥ k) for X ~ Binomial(n, p). */
+  function binomTail(k, n, p) {
+    if (k <= 0) return 1;
+    if (p <= 0) return 0;
+    if (p >= 1) return 1;
+    const lp = Math.log(p), lq = Math.log(1 - p), ln = logGamma(n + 1);
+    let s = 0;
+    for (let i = k; i <= n; i++) {
+      const term = Math.exp(ln - logGamma(i + 1) - logGamma(n - i + 1) + i * lp + (n - i) * lq);
+      s += term;
+      if (term < s * 1e-12 && i > n * p) break;
+    }
+    return Math.min(1, s);
+  }
+
+  /** Items {n, k} well above `base`: one-sided binomial, Bonferroni over those read. */
+  function aboveChance(items, base, minN) {
+    const read = items.filter((x) => x.n >= minN);
+    const cut = FAULT_ALPHA / Math.max(read.length, 1);
+    const out = read.filter((x) => x.k / x.n > base).map((x) => ({ ...x, p: binomTail(x.k, x.n, base) })).filter((x) => x.p < cut);
+    return { read: read.length, cut, items: out.sort((a, b) => b.k - a.k) };
+  }
+
+  /** Pool the problem-location blocks of one or more days (metrics._faults). */
+  function faultStats(blocks) {
+    blocks = blocks.filter(Boolean);
+    if (!blocks.length) return null;
+    const pct = (a, b) => (b ? r((a / b) * 100) : null);
+    const sumOf = (f) => blocks.reduce((a, b) => a + (f(b) || 0), 0);
+    const out = { days: blocks.length };
+
+    const B = blocks.map((b) => b.buffer).filter(Boolean);
+    if (B.length) {
+      const pickups = B.reduce((a, b) => a + b.pickups, 0), flagged = B.reduce((a, b) => a + b.flagged, 0);
+      const base = pickups ? flagged / pickups : 0;
+      const aisles = Array.from(new Set(B.flatMap((b) => b.aisles))).sort((a, b) => a - b);
+      const bays = Array.from(new Set(B.flatMap((b) => b.bays))).sort((a, b) => a - b);
+      const n = aisles.map(() => bays.map(() => 0)), k = aisles.map(() => bays.map(() => 0)), days = aisles.map(() => bays.map(() => 0));
+      for (const b of B) {
+        b.aisles.forEach((a, i) => {
+          const ai = aisles.indexOf(a);
+          b.bays.forEach((y, j) => {
+            const bj = bays.indexOf(y);
+            n[ai][bj] += b.n[i][j]; k[ai][bj] += b.k[i][j];
+            if (b.k[i][j] > 0) days[ai][bj]++;
+          });
+        });
+      }
+      const slotName = (a, y) => `HAI-${String(a).padStart(3, "0")}-${String(y).padStart(3, "0")}`;
+      const slots = [];
+      aisles.forEach((a, i) => bays.forEach((y, j) => { if (n[i][j]) slots.push({ slot: slotName(a, y), aisle: a, bay: y, n: n[i][j], k: k[i][j], days_flagged: days[i][j] }); }));
+      const badSlots = aboveChance(slots, base, FAULT_SLOT_MIN_N);
+      const byRobot = {};
+      for (const b of B) for (const [rb, rn, rk] of b.robots) { const t = byRobot[rb] || (byRobot[rb] = { robot: rb, n: 0, k: 0 }); t.n += rn; t.k += rk; }
+      const badRobots = aboveChance(Object.values(byRobot), base, FAULT_ROBOT_MIN_N);
+      const rep = (key) => {
+        const x = B.reduce((acc, b) => acc.map((v, i) => v + b.repeat[key][i]), [0, 0, 0, 0]);
+        return { after_flag_n: x[0], after_flag_pct: pct(x[1], x[0]), after_clean_n: x[2], after_clean_pct: pct(x[3], x[2]) };
+      };
+      const lag = B.reduce((a, b) => addInto(a, b.lag_hist), []);
+      const byAisle = aisles.map((a, i) => ({ aisle: a, n: n[i].reduce((s, v) => s + v, 0), k: k[i].reduce((s, v) => s + v, 0) }))
+        .map((x) => ({ ...x, pct: pct(x.k, x.n) }));
+      out.buffer = {
+        pickups, flagged, flags: B.reduce((a, b) => a + b.flags, 0), flagged_pct: pct(flagged, pickups), base_pct: r(base * 100, 2),
+        aisles, bays, rate: n.map((row, i) => row.map((v, j) => (v >= FAULT_CELL_MIN_N ? r((k[i][j] / v) * 100) : null))), n, k,
+        slots_read: badSlots.read, slots_total: slots.length,
+        bad_slots: badSlots.items.map((x) => ({ ...x, pct: pct(x.k, x.n), times_base: base ? r(x.k / x.n / base, 1) : null })),
+        bad_slots_flag_pct: pct(badSlots.items.reduce((a, x) => a + x.k, 0), flagged),
+        robots_read: badRobots.read,
+        bad_robots: badRobots.items.map((x) => ({ ...x, pct: pct(x.k, x.n), times_base: base ? r(x.k / x.n / base, 1) : null })),
+        bad_robots_flag_pct: pct(badRobots.items.reduce((a, x) => a + x.k, 0), flagged),
+        repeat: { slot: rep("slot"), tote: rep("tote"), robot: rep("robot") },
+        lag_med: r(histQuantile(lag, B[0].lag_w, 0.5), 1), lag_hist: lag, lag_w: B[0].lag_w,
+        by_aisle: byAisle,
+        hourly: Array.from({ length: 24 }, (_, h) => { const hn = B.reduce((a, b) => a + b.hourly[h][0], 0), hk = B.reduce((a, b) => a + b.hourly[h][1], 0); return { h, n: hn, k: hk, pct: pct(hk, hn) }; }),
+        alpha: FAULT_ALPHA, slot_min_n: FAULT_SLOT_MIN_N, robot_min_n: FAULT_ROBOT_MIN_N, cell_min_n: FAULT_CELL_MIN_N,
+      };
+    }
+
+    const St = blocks.map((b) => b.storage).filter(Boolean);
+    if (St.length) {
+      const dep = (key, d) => St.reduce((a, s_) => a + (s_[key][d] || 0), 0);
+      const depth = ["1", "2"].map((d) => ({ depth: d, putaways: dep("putaways", d), failed: dep("put_failed", d), pct: pct(dep("put_failed", d), dep("putaways", d)) }));
+      const stuck = {};
+      St.forEach((s_, di) => {
+        for (const x of s_.stuck) {
+          const t = stuck[x.loc] || (stuck[x.loc] = { loc: x.loc, attempts: 0, acr_s: 0, days: 0, robots_max: 0, totes: new Set() });
+          t.attempts += x.attempts; t.acr_s += x.acr_s || 0; t.days++; t.robots_max = Math.max(t.robots_max, x.robots);
+          x.totes.forEach((tt) => t.totes.add(tt));
+        }
+      });
+      const susp = {};
+      for (const s_ of St) for (const [m, c] of Object.entries(s_.suspended)) susp[m] = (susp[m] || 0) + c;
+      const stuckList = Object.values(stuck).map((t) => ({ ...t, acr_h: r(t.acr_s / 3600, 1), totes: Array.from(t.totes) })).sort((a, b) => b.attempts - a.attempts);
+      out.storage = {
+        depth, failed_loads: sumOf((b) => b.storage && b.storage.failed_loads), acr_h: r(sumOf((b) => b.storage && b.storage.acr_s) / 3600, 1),
+        stuck: stuckList, stuck_attempts: stuckList.reduce((a, x) => a + x.attempts, 0), stuck_acr_h: r(stuckList.reduce((a, x) => a + x.acr_s, 0) / 3600, 1),
+        stuck_min: St[0].stuck_min,
+        suspended: Object.entries(susp).sort((a, b) => b[1] - a[1]).map(([message, n]) => ({ message, n })),
+      };
+    }
+    return out.buffer || out.storage ? out : null;
+  }
+
+  /** The problem-location reading in words — the same for a day or a run. */
+  function faultText(F, scope) {
+    if (!F) return {};
+    const out = {}, B = F.buffer, St = F.storage;
+    if (B && B.pickups) {
+      const p = [`${f1(B.flagged_pct)}% of the K50s' buffer pickups ${scope} (${B.flagged.toLocaleString()} of ${B.pickups.toLocaleString()}) came just after the slot reported that the robot's tries to take the tote had gone over the limit — the closest the log comes to "it needed several scans". The pickup followed a median ${f1(B.lag_med)} s later.`];
+      const s_ = B.repeat.slot, t = B.repeat.tote;
+      if (s_.after_flag_n >= 30 && t.after_flag_n >= 30) {
+        const slotLift = s_.after_clean_pct ? s_.after_flag_pct / s_.after_clean_pct : 1, toteLift = t.after_clean_pct ? t.after_flag_pct / t.after_clean_pct : 1;
+        p.push(`After a flagged pickup, the slot's next pickup — another tote — was flagged ${f1(s_.after_flag_pct)}% of the time, against ${f1(s_.after_clean_pct)}% after a clean one; the tote's next pickup from another slot, ${f1(t.after_flag_pct)}% against ${f1(t.after_clean_pct)}%.`);
+        if (slotLift >= 1.15 && toteLift < 1.1) p.push("The trouble stays with the slot, not with the tote: this is not a bad label travelling with a tote.");
+        else if (toteLift >= 1.15 && slotLift < 1.1) p.push("The trouble travels with the tote, not with the slot: look at the totes' labels.");
+        else if (toteLift >= 1.15 && slotLift >= 1.15) p.push("Both slots and totes carry it.");
+      }
+      if (B.bad_slots.length) {
+        const top = B.bad_slots.slice(0, 3);
+        p.push(`${B.bad_slots.length} of the ${B.slots_read.toLocaleString()} slots read are flagged far more often than chance, holding ${f0(B.bad_slots_flag_pct)}% of all flags — worst ${top.map((x) => `${x.slot} (${f0(x.pct)}% of ${x.n.toLocaleString()} pickups)`).join(", ")}.`);
+      } else p.push("No slot is flagged more often than chance would give it.");
+      const ai = B.by_aisle.filter((x) => x.n >= 200).sort((a, b) => b.pct - a.pct);
+      if (ai.length >= 4 && ai[0].pct >= 1.5 * ai[ai.length - 1].pct)
+        p.push(`By buffer aisle it runs from ${f1(ai[0].pct)}% (aisle ${ai[0].aisle}) down to ${f1(ai[ai.length - 1].pct)}% (aisle ${ai[ai.length - 1].aisle}).`);
+      out.buffer = p.join(" ");
+      if (B.bad_robots.length) {
+        const w = B.bad_robots[0];
+        out.robots = `${B.bad_robots.length} K50s are flagged more often than chance, wherever they pick up, holding ${f0(B.bad_robots_flag_pct)}% of all flags. The worst, ${w.robot}, was flagged on ${f0(w.pct)}% of its ${w.n.toLocaleString()} pickups (${f1(w.times_base)}× the rate) — check its camera or scanner.`;
+      }
+    }
+    if (St) {
+      const sp = [], d1 = St.depth[0], d2 = St.depth[1];
+      if (d1.failed + d2.failed) {
+        const share = (d2.failed / (d1.failed + d2.failed)) * 100, putShare = d1.putaways + d2.putaways ? (d2.putaways / (d1.putaways + d2.putaways)) * 100 : null;
+        sp.push(`${(d1.failed + d2.failed).toLocaleString()} put-aways into storage failed (the ACR could not put the tote down). ${f0(share)}% of them were at rear slots (depth 2), which take ${f0(putShare)}% of put-aways${d1.pct && d2.pct ? ` — ${f0(d2.pct / d1.pct)}× the front-slot failure rate` : ""}.`);
+      }
+      if (St.stuck.length) {
+        const w = St.stuck[0];
+        sp.push(`${St.stuck.length} storage slot${St.stuck.length > 1 ? "s" : ""} held a tote the ACRs could not take out, and they kept trying: ${St.stuck_attempts.toLocaleString()} failed loads costing ${f1(St.stuck_acr_h)} ACR-hours (allocation → failure). The worst, ${w.loc}, took ${w.attempts.toLocaleString()} attempts over ${w.days} day${w.days > 1 ? "s" : ""} (${f1(w.acr_h)} ACR-hours). Clearing those slots by hand would give that time back.`);
+      }
+      out.storage = sp.join(" ");
+    }
+    return out;
+  }
+
+  // ── robot health ────────────────────────────────────────────────────────
+  const ROBOT_FAULTS = [
+    { key: "chassis", label: "Chassis fault", fleet: "K50", note: "ROBOT_ABNORMAL: actuator (chassis) reported a fault" },
+    { key: "lift", label: "Lift dislocation", fleet: "K50", note: "ROBOT_ABNORMAL: actuator (lift) reported dislocation" },
+    { key: "dropped", label: "Box dropped", fleet: "K50", note: "ROBOT_ABNORMAL: the robot detected a dropped box" },
+    { key: "unreachable", label: "Target not reachable", fleet: null, note: "ROBOT_ABNORMAL: the target position is not reachable from where the robot is" },
+    { key: "move_command", label: "Bad move command", fleet: null, note: "ROBOT_ABNORMAL: a move command the robot could not parse (missing curve parameters)" },
+    { key: "robot_other", label: "Other robot fault", fleet: null, note: "any other ROBOT_ABNORMAL" },
+    { key: "put_failed", label: "Could not put the tote down", fleet: "ACR", note: "TASK_SUSPENDED: hooked failed, fail to put the box" },
+    { key: "no_box", label: "No tote at the slot", fleet: "ACR", note: "TASK_SUSPENDED: the sensor found no box where the tote should be" },
+    { key: "suspended_other", label: "Other stop", fleet: null, note: "any other TASK_SUSPENDED" },
+    { key: "load_failed", label: "Could not take the tote", fleet: null, note: "TOTE_LOAD_FAILED, stuck storage slots left out" },
+    { key: "cancelled", label: "Task cancelled", fleet: null, note: "TASK_CANCELLED naming the robot" },
+  ];
+  // A robot is slow when its speed index is this far above 1 (with ROBOT_MIN_TRIPS trips).
+  const ROBOT_SLOW_INDEX = 1.1, ROBOT_MIN_TRIPS = 100;
+  // A fault kind belongs to particular robots when its dispersion is at least this (1 = chance).
+  const ROBOT_DISPERSION = 3;
+  // A robot is listed for a fault kind with at least this many events and this × its expected count.
+  const ROBOT_MIN_EVENTS = 5, ROBOT_MIN_TIMES = 2;
+
+  /** P(X ≥ k) for X ~ Poisson(lambda). */
+  function poissonTail(k, lambda) {
+    if (k <= 0) return 1;
+    if (lambda <= 0) return 0;
+    let s = 0, term = Math.exp(-lambda + k * Math.log(lambda) - logGamma(k + 1));
+    for (let i = k; i < k + 5000; i++) {
+      s += term;
+      term *= lambda / (i + 1);
+      if (i > lambda && term < s * 1e-12) break;
+    }
+    return Math.min(1, s);
+  }
+  const rankCorr = (a, b) => {
+    const rk = (v) => { const o = v.map((x, i) => [x, i]).sort((p, q) => p[0] - q[0]), out = new Array(v.length); o.forEach(([, i], j) => { out[i] = j; }); return out; };
+    return a.length >= 10 ? corr(rk(a), rk(b)) : null;
+  };
+
+  /**
+   * Pool the robot blocks of one or more days (metrics._robots), with each day's
+   * buffer flags per K50 (metrics._faults).  Every fault kind is tested robot by
+   * robot against its fleet, with the robot's tasks as the exposure.
+   */
+  function robotStats(blocks, faultBlocks) {
+    const idx = blocks.map((b, i) => (b ? i : -1)).filter((i) => i >= 0);
+    if (!idx.length) return null;
+    const pct = (a, b) => (b ? r((a / b) * 100) : null);
+    const bot = {};
+    const get = (rb, fleet) => bot[rb] || (bot[rb] = { robot: rb, fleet, tasks: 0, trips: 0, on_s: 0, act_s: 0, exp_s: 0, faults: {}, half: [{ tasks: 0, act: 0, exp: 0, trips: 0, on: 0, faults: {} }, { tasks: 0, act: 0, exp: 0, trips: 0, on: 0, faults: {} }], pick: 0, flagged: 0 });
+    idx.forEach((di, n) => {
+      const b = blocks[di], h = n % 2;
+      for (const [rb, tasks, cyc, on, ret, exp] of b.K50) { const t = get(rb, "K50"); t.tasks += tasks; t.trips += cyc; t.on_s += on || 0; t.act_s += ret || 0; t.exp_s += exp || 0; const x = t.half[h]; x.tasks += tasks; x.trips += cyc; x.on += on || 0; x.act += ret || 0; x.exp += exp || 0; }
+      for (const [rb, tasks, puts, sec, exp] of b.ACR) { const t = get(rb, "ACR"); t.tasks += tasks; t.trips += puts; t.act_s += sec || 0; t.exp_s += exp || 0; const x = t.half[h]; x.tasks += tasks; x.trips += puts; x.act += sec || 0; x.exp += exp || 0; }
+      for (const [k, per] of Object.entries(b.faults || {})) for (const [rb, c] of Object.entries(per)) {
+        const t = bot[rb]; if (!t) continue;
+        t.faults[k] = (t.faults[k] || 0) + c; t.half[h].faults[k] = (t.half[h].faults[k] || 0) + c;
+      }
+      const fb = faultBlocks && faultBlocks[di] && faultBlocks[di].buffer;
+      if (fb) for (const [rb, pn, pk] of fb.robots) { const t = bot[rb]; if (t) { t.pick += pn; t.flagged += pk; } }
+    });
+    const all = Object.values(bot);
+    const fleetOf = (f) => all.filter((t) => t.fleet === f && t.tasks > 0);
+
+    // Fault kinds: dispersion and the robots above chance, within the fleet that has them.
+    const kinds = [], flagged = [];
+    for (const k of ROBOT_FAULTS) {
+      for (const fleet of ["K50", "ACR"]) {
+        if (k.fleet && k.fleet !== fleet) continue;
+        const R_ = fleetOf(fleet), total = R_.reduce((a, t) => a + (t.faults[k.key] || 0), 0);
+        if (total < 10) continue;
+        const tasks = R_.reduce((a, t) => a + t.tasks, 0);
+        let chi = 0;
+        const above = [];
+        for (const t of R_) {
+          const c = t.faults[k.key] || 0, e = (total * t.tasks) / tasks;
+          if (e > 0) chi += ((c - e) * (c - e)) / e;
+          if (c >= ROBOT_MIN_EVENTS && c >= ROBOT_MIN_TIMES * e && poissonTail(c, e) < FAULT_ALPHA / R_.length) above.push({ robot: t.robot, fleet, kind: k.key, label: k.label, events: c, expected: r(e, 1), times: r(c / e, 1) });
+        }
+        above.sort((a, b) => b.times - a.times);
+        let consistency = null;
+        if (idx.length >= 4) {
+          const rate = (t, h) => (t.half[h].tasks ? (t.half[h].faults[k.key] || 0) / t.half[h].tasks : 0);
+          const R2 = R_.filter((t) => t.half[0].tasks && t.half[1].tasks);
+          consistency = r(rankCorr(R2.map((t) => rate(t, 0)), R2.map((t) => rate(t, 1))), 2);
+        }
+        const dispersion = R_.length > 1 ? r(chi / (R_.length - 1), 1) : null;
+        kinds.push({ ...k, fleet, events: total, robots_with: R_.filter((t) => t.faults[k.key]).length, robots: R_.length, dispersion, robot_bound: dispersion != null && dispersion >= ROBOT_DISPERSION, consistency, above: above.length, top: above.slice(0, 3).map((x) => x.robot) });
+        flagged.push(...above);
+      }
+    }
+    // Performance: K50 cycles per hour on a task and return-trip index; ACR handling index.
+    const perf = (fleet) => {
+      const R_ = all.filter((t) => t.fleet === fleet && t.trips >= ROBOT_MIN_TRIPS && t.exp_s > 0);
+      const idxs = R_.map((t) => t.act_s / t.exp_s).sort((a, b) => a - b);
+      const q = (p) => (idxs.length ? r(quantile(idxs, p), 3) : null);
+      const out = { robots: R_.length, index_p5: q(0.05), index_med: q(0.5), index_p95: q(0.95),
+        slow: R_.filter((t) => t.act_s / t.exp_s >= ROBOT_SLOW_INDEX).map((t) => ({ robot: t.robot, index: r(t.act_s / t.exp_s, 2), trips: t.trips })) };
+      if (fleet === "K50") {
+        const cph = R_.filter((t) => t.on_s > 0).map((t) => (t.trips * 3600) / t.on_s).sort((a, b) => a - b);
+        Object.assign(out, { cph_p5: r(quantile(cph, 0.05), 2), cph_med: r(quantile(cph, 0.5), 2), cph_p95: r(quantile(cph, 0.95), 2) });
+      }
+      if (idx.length >= 4) {
+        const R2 = R_.filter((t) => t.half[0].exp && t.half[1].exp);
+        out.index_consistency = r(rankCorr(R2.map((t) => t.half[0].act / t.half[0].exp), R2.map((t) => t.half[1].act / t.half[1].exp)), 2);
+        if (fleet === "K50") {
+          const R3 = R_.filter((t) => t.half[0].on && t.half[1].on);
+          out.cph_consistency = r(rankCorr(R3.map((t) => t.half[0].trips / t.half[0].on), R3.map((t) => t.half[1].trips / t.half[1].on)), 2);
+        }
+      }
+      return out;
+    };
+    const flagsBy = {};
+    for (const f of flagged) (flagsBy[f.robot] = flagsBy[f.robot] || []).push(f);
+    const rows = all.filter((t) => t.tasks > 0).sort((a, b) => natural(a.robot, b.robot)).map((t) => {
+      const fsum = Object.values(t.faults).reduce((a, v) => a + v, 0);
+      const topK = Object.entries(t.faults).sort((a, b) => b[1] - a[1])[0];
+      return { robot: t.robot, fleet: t.fleet, tasks: t.tasks, trips: t.trips,
+        cph: t.fleet === "K50" && t.on_s ? r((t.trips * 3600) / t.on_s, 2) : null,
+        index: t.exp_s ? r(t.act_s / t.exp_s, 3) : null,
+        faults: fsum, per_1000_tasks: t.tasks ? r((fsum / t.tasks) * 1000, 1) : null,
+        top_fault: topK ? ROBOT_FAULTS.find((k) => k.key === topK[0]).label + ` (${topK[1]})` : null,
+        buffer_flag_pct: t.pick ? pct(t.flagged, t.pick) : null,
+        above: (flagsBy[t.robot] || []).map((f) => f.label) };
+    });
+    const leftOut = blocks.reduce((a, b) => a + ((b && b.stuck_left_out) || 0), 0);
+    return { days: idx.length, kinds, flagged: flagged.sort((a, b) => b.times - a.times), robots_flagged: Object.keys(flagsBy).length,
+      k50: perf("K50"), acr: perf("ACR"), rows, stuck_left_out: leftOut,
+      slow_index: ROBOT_SLOW_INDEX, min_trips: ROBOT_MIN_TRIPS, speed_cap: blocks[idx[0]].speed_cap, dispersion_cut: ROBOT_DISPERSION, alpha: FAULT_ALPHA, min_events: ROBOT_MIN_EVENTS, min_times: ROBOT_MIN_TIMES };
+  }
+
+  /** 0.97 → "3% faster", 1.05 → "5% slower". */
+  const speedWord = (x) => (x < 1 ? `${f0((1 - x) * 100)}% faster` : `${f0((x - 1) * 100)}% slower`);
+
+  /** The robot reading in words — the same for a day or a run. */
+  function robotText(R, scope) {
+    if (!R) return {};
+    const out = {}, K = R.k50, A = R.acr, p = [];
+    if (K.robots) {
+      p.push(`Robot by robot ${scope}, K50s ran ${f1(K.cph_p5)}–${f1(K.cph_p95)} cycles per hour on a task (5th–95th percentile of robots), and their return trips ranged from ${speedWord(K.index_p5)} to ${speedWord(K.index_p95)} than usual for the same route.`);
+      p.push(K.slow.length ? `${K.slow.length} K50${K.slow.length > 1 ? "s run" : " runs"} ${f0((R.slow_index - 1) * 100)}%+ slower: ${K.slow.map((x) => x.robot).join(", ")}.` : `No K50 is ${f0((R.slow_index - 1) * 100)}% slower than the rest.`);
+    }
+    if (A.robots) p.push(`ACR handling (storage load → buffer unload) ranged from ${speedWord(A.index_p5)} to ${speedWord(A.index_p95)} than usual for the rack level${A.slow.length ? `; ${A.slow.map((x) => x.robot).join(", ")} ${A.slow.length > 1 ? "are" : "is"} ${f0((R.slow_index - 1) * 100)}%+ slower` : ""}.`);
+    const holds = (c) => (c >= 0.6 ? "holds" : c >= 0.3 ? "partly holds" : "does not hold");
+    if (K.cph_consistency != null && A.index_consistency != null)
+      p.push(`From one half of the days to the other, the robots' order by K50 cycle rate ${holds(K.cph_consistency)} (rank correlation ${f2(K.cph_consistency)}) and by ACR handling speed ${holds(A.index_consistency)} (${f2(A.index_consistency)})` +
+        (K.index_p95 < R.slow_index && A.index_p95 < R.slow_index ? " — but every robot is within a few percent of the others, so speed is not where the robots differ." : "."));
+    out.perf = p.join(" ");
+
+    const fp = [], bound = R.kinds.filter((k) => k.robot_bound), chance = R.kinds.filter((k) => !k.robot_bound);
+    if (bound.length) fp.push(`Faults that belong to particular robots: ${bound.map((k) => `${k.label.toLowerCase()} (${k.fleet}, ${k.dispersion}× the spread chance gives${k.top.length ? `; most: ${k.top.join(", ")}` : ""})`).join("; ")}.`);
+    if (chance.length) fp.push(`Spread across the fleet about as chance would: ${chance.map((k) => `${k.label.toLowerCase()} (${k.fleet})`).join(", ")} — a system or process matter, not individual robots.`);
+    if (R.flagged.length) {
+      const w = R.flagged[0];
+      fp.push(`${R.robots_flagged} robot${R.robots_flagged > 1 ? "s have" : " has"} a fault kind well above the fleet's rate for the work done. The furthest out: ${w.robot}, ${w.events} × "${w.label.toLowerCase()}" against ${f1(w.expected)} expected (${f1(w.times)}×).`);
+    }
+    out.faults = fp.join(" ");
     return out;
   }
 
@@ -1041,6 +1487,9 @@
     out.relations = relationText(D.relations, "today");
     if (D.multi) out.multi = multiText(D.multi, D.relations, "today");
     if (D.starve) out.starve = starveText(D.starve, "today");
+    if (D.k50_time) out.k50_time = cycleTimeText(D.k50_time, "today");
+    if (D.faults) out.faults = faultText(D.faults, "today");
+    if (D.robots) out.robots = robotText(D.robots, "today");
     if (D.spatial) out.spatial = spatialText(D.spatial, "today");
 
     // station slots
@@ -1142,6 +1591,9 @@
     { key: "multi_excess_pct", label: "Station waiting added by multi-station", unit: "%", better: -1 },
     { key: "starved_pct", label: "Starved handovers", unit: "%", better: -1 },
     { key: "travel_med", label: "Buffer pickup → station (median)", unit: "s", better: -1 },
+    { key: "k50_queue_pct", label: "K50 cycle time queueing", unit: "%", better: -1 },
+    { key: "starved_fast_pick_pct", label: "Starved after a pick under 6 s", unit: "%", better: -1 },
+    { key: "closed_h", label: "Station closed or disabled, full hours", unit: "h", better: 0 },
   ];
   const BY_STATION = [
     { key: "visits", label: "Totes presented", unit: "", note: "Robot arrivals at the station across the whole day." },
@@ -1178,6 +1630,9 @@
         multi_excess_pct: D.multi ? D.multi.excess_pct : null,
         starved_pct: D.starve ? D.starve.starved_pct : null,
         travel_med: D.starve ? D.starve.travel.med : null,
+        k50_queue_pct: D.k50_time ? D.k50_time.segments.find((x) => x.key === "queue").pct : null,
+        starved_fast_pick_pct: D.starve && D.starve.pick ? D.starve.pick.fast_starved_pct : null,
+        closed_h: D.starve && D.starve.closed ? D.starve.closed.wait_h_full : null,
         k50_util: d.utilization && d.utilization.K50 ? d.utilization.K50.day.util_fleet_full : null,
         k50_avail_util: d.utilization && d.utilization.K50 ? d.utilization.K50.day.util_available_full : null,
         k50_away: d.utilization && d.utilization.K50 ? d.utilization.K50.day.away_full : null,
@@ -1206,15 +1661,31 @@
       byHour.k50_util.push(days.map((d) => utilAt(d, "K50", h)));
       byHour.acr_util.push(days.map((d) => utilAt(d, "ACR", h)));
     }
+    // Average switch by station and hour over every day: Σ switch seconds ÷ Σ handovers.
+    const hmSwMean = stations.map((st) => R24.map((h) => {
+      let sum = 0, n = 0;
+      days.forEach((d, i) => {
+        const s = d.stations.indexOf(st);
+        if (s < 0 || !derived[i]._swSum) return;
+        sum += derived[i]._swSum[s][h]; n += d.raw.gap[s][h].length;
+      });
+      return n ? r(sum / n) : null;
+    }));
     const hours = derived.flatMap((D) => D.hours);
     const S = { days: days.map((d) => d.date), stations, headline: rows, medians, by_station: byStation, by_hour: byHour,
-                hours, relations: relations(hours) };
+                hm_sw_mean: hmSwMean, hours, relations: relations(hours) };
     S.multi = multiStats(days.map((d) => d.multi), days.map((d) => d.robot_k50 && d.robot_k50.stations_hist));
     S.text = summaryText(S);
     S.text.relations = relationText(S.relations, "across these days");
     if (S.multi) S.text.multi = multiText(S.multi, S.relations, "across these days");
     S.starve = starveStats(days.map((d) => d.starve));
     if (S.starve) S.text.starve = starveText(S.starve, "across these days");
+    S.k50_time = cycleTimeStats(days.map((d) => d.k50_time));
+    if (S.k50_time) S.text.k50_time = cycleTimeText(S.k50_time, "across these days");
+    S.faults = faultStats(days.map((d) => d.faults));
+    if (S.faults) S.text.faults = faultText(S.faults, "across these days");
+    S.robots = robotStats(days.map((d) => d.robots), days.map((d) => d.faults));
+    if (S.robots) S.text.robots = robotText(S.robots, "across these days");
     S.spatial = spatialStats(days.map((d) => d.spatial));
     if (S.spatial) S.text.spatial = spatialText(S.spatial, "across these days");
     return S;
@@ -1262,7 +1733,7 @@
 
   const ENGINE = {
     lowerBound, upperBound, quantile, prefix, doorSeconds, cappedPickSeconds, mergeSorted, hasDoor,
-    prepare, targetFor, stationTargets, targetUtil, computeDay, hourPoints, relations, multiStats, multiText, HANDOVER_KINDS, starveStats, starveText, spatialStats, spatialText, CROWD_LABELS, histQuantile, STARVE_STAGES, CONTEXT_KINDS, HOUR_METRICS, HOUR_PRESETS, computeBudget, computeSummary, runs, natural, r, mean, median, corr,
+    prepare, targetFor, stationTargets, targetUtil, computeDay, hourPoints, relations, multiStats, multiText, HANDOVER_KINDS, starveStats, starveText, cycleTimeStats, cycleTimeText, K50_SEGMENTS, faultStats, faultText, binomTail, robotStats, robotText, poissonTail, ROBOT_FAULTS, spatialStats, spatialText, CROWD_LABELS, histQuantile, STARVE_STAGES, CONTEXT_KINDS, HOUR_METRICS, HOUR_PRESETS, computeBudget, computeSummary, runs, natural, r, mean, median, corr,
     HEADLINE, BY_STATION, BY_HOUR,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = ENGINE;

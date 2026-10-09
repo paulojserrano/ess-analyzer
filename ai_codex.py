@@ -155,6 +155,12 @@ EVENTS = [
     ('CALLBACK_OF_TOTE_UNLOADED_BY_ROBOT', 'move end', 'tote put down'),
     ('CALLBACK_OF_TASK_ALLOCATED', 'busy from', 'robot given a task; stationCode = K50 destination'),
     ('wmsTask[...]: ND... is created', 'supply', 'task created by the warehouse system (destinationCodes)'),
+    ('CALLBACK_OF_TASK_EXCEPTION', 'closure', "message DISABLED_TARGET = the task's station is disabled"),
+    ('CALLBACK_OF_LOCATION_ABNORMAL', 'fault', 'load/unload tries at a slot over the limit (by location)'),
+    ('CALLBACK_OF_TOTE_LOAD_FAILED', 'fault', 'a robot could not take a tote from a slot'),
+    ('CALLBACK_OF_TASK_SUSPENDED', 'fault', 'a robot stopped mid-task (e.g. could not put the tote)'),
+    ('CALLBACK_OF_ROBOT_ABNORMAL', 'fault', 'robot fault: chassis, lift, box dropped, unreachable, ...'),
+    ('CALLBACK_OF_TASK_CANCELLED', 'fault', 'a task cancelled'),
 ]
 
 DEFINITIONS = [
@@ -180,6 +186,15 @@ DEFINITIONS = [
     'starve stages   where the arriving robot was in each waiting second: no task yet /',
     '                ACR / tote ready, no K50 / K50 to buffer / carrying the tote /',
     '                at another station - split exactly, so they sum to the wait',
+    'closed          a handover whose leaving robot was held over CLOSED_HOLD_S (break,',
+    '                shift change) or whose gap holds a DISABLED_TARGET exception for a',
+    '                task bound there; reported apart, never counted as starvation',
+    'pick before     operator time of the visit just released, in bands, vs starvation',
+    'refill          starved after a pick < 12 s: previous arrival -> next arrival',
+    'K50 cycle time  fetch (alloc -> pickup) / travel / queue / at station (first',
+    '                arrival -> last release) / return (-> buffer unload); travel =',
+    '                min(pickup -> arrival, free-flow), free-flow = 10th percentile per',
+    '                station x buffer aisle; queue = the rest',
     'en route        K50s allocated to the station, not yet arrived, at the release',
     'station slots   tasks assigned to a station (K50 alloc -> release); a limit is a',
     '                ceiling it sits at while its ready totes pile up behind it',
@@ -191,6 +206,16 @@ DEFINITIONS = [
     'return trip     a store (buffer -> storage) whose tote is put again later; minutes',
     '                until that next put, in bands',
     'buffer travel   K50 buffer pickup -> first arrival, by buffer aisle x station',
+    'flagged pickup  K50 buffer load preceded (<= 10 min) by LOCATION_ABNORMAL',
+    '                LOAD_FAILED_COUNT_EXCEEDED_THE_LIMIT for that tote and slot',
+    'slot vs tote    next pickup by the same slot (other tote) / tote (other slot)',
+    '                after a flagged vs a clean pickup',
+    'stuck slot      5+ TOTE_LOAD_FAILED at one storage slot in a day (left out of',
+    '                the robot faults: the slot is the problem)',
+    'robot fault     kinds read by message; expected = kind total x robot share of',
+    '                the fleet tasks; dispersion = chi2/(robots-1), 1 = chance',
+    'speed index     K50: return trip / day median for station x buffer aisle;',
+    '                ACR: handling / day median for the rack level',
 ]
 
 SETTINGS = [
@@ -204,7 +229,7 @@ SETTING_TABLES = ['targets  {station|zone: totes/h}', 'pick_s   {station|zone: s
                   'no_door_days [YYYY-MM-DD]   days the doors were not in use: no door seconds at all']
 
 TUNING = ('FULL_HOUR_SHARE', 'HIGH_RATE_SHARE', 'LONG_PICK_S',
-          'IDLE_MIN_MINUTES', 'MAX_SWITCH_S', 'DOOR_S_MAX', 'AWAY_MIN_S')
+          'IDLE_MIN_MINUTES', 'MAX_SWITCH_S', 'DOOR_S_MAX', 'AWAY_MIN_S', 'CLOSED_HOLD_S')
 
 
 def _const(content: str, name: str) -> str:
@@ -242,6 +267,8 @@ def generate_log_schema() -> str:
         "  tote_events  ts, kind (load/unload), robot, tote, loc, task",
         "  allocations  ts, robot, task, station",
         "  created      ts, task, dest",
+        "  exceptions   ts, task, message",
+        "  faults       ts, kind, loc, tote, robot, task, message",
         "  moves        robot, tote, t_load, t_unload, from_loc, to_loc, task",
         "  roles        {robot: 'K50' | 'ACR'}",
         "",

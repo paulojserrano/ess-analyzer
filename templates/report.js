@@ -21,6 +21,7 @@
   const fix = (v, nd = 2) => (v == null ? "–" : Number(v).toFixed(nd));
   const int = (v) => (v == null ? "–" : Math.round(v).toLocaleString());
   const hh = (h) => String(h).padStart(2, "0");
+  const pctl = (q) => { const n = Math.round(q * 100), t = n % 100 >= 11 && n % 100 <= 13 ? "th" : ["th", "st", "nd", "rd"][n % 10] || "th"; return n + t; };
   const prettyDate = (iso, opts = { weekday: "short", day: "numeric", month: "short", year: "numeric" }) =>
     new Date(iso + "T12:00:00").toLocaleDateString(undefined, opts);
   const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -363,9 +364,9 @@
 
   /** Hours of station waiting in each hour of the day, stacked by stage. */
   function stageHoursChart(S) {
-    const col = STAGE_COL(), stages = E.STARVE_STAGES;
-    const W = 1000, H = 300, p = { l: 46, r: 12, t: 14, b: 60 }, n = 24, bw = (W - p.l - p.r) / n;
-    const tot = S.hourly.map((h) => stages.reduce((a, st) => a + (h.stages[st.key] || 0), 0));
+    const col = STAGE_COL(), stages = E.STARVE_STAGES, hasClosed = S.hourly.some((h) => h.closed > 0);
+    const W = 1000, H = hasClosed ? 320 : 300, p = { l: 46, r: 12, t: 14, b: hasClosed ? 80 : 60 }, n = 24, bw = (W - p.l - p.r) / n;
+    const tot = S.hourly.map((h) => stages.reduce((a, st) => a + (h.stages[st.key] || 0), 0) + (h.closed || 0));
     const ymax = Math.max(0.1, ...tot) * 1.08, step = niceStep(ymax, 5);
     const Y = (v) => H - p.b - ((H - p.t - p.b) * v) / ymax;
     let b = "";
@@ -377,10 +378,12 @@
         if (v > 0) b += `<rect x="${p.l + i * bw + bw * 0.15}" y="${Y(acc + v)}" width="${bw * 0.7}" height="${Y(acc) - Y(acc + v)}" fill="${col[st.key]}"><title>${hh(h.h)}:00 — ${esc(st.label)}: ${num(v, 2)} h</title></rect>`;
         acc += v;
       }
+      if (h.closed > 0) b += `<rect x="${p.l + i * bw + bw * 0.15}" y="${Y(acc + h.closed)}" width="${bw * 0.7}" height="${Y(acc) - Y(acc + h.closed)}" fill="none" stroke="${P.muted}" stroke-dasharray="3 2"><title>${hh(h.h)}:00 — station closed or disabled (not starvation): ${num(h.closed, 2)} h</title></rect>`;
       b += T(p.l + i * bw + bw / 2, H - p.b + 16, hh(h.h), { "text-anchor": "middle", fill: P.muted });
     });
     b += T(p.l, p.t - 2, "hours of station waiting", { fill: P.muted, "font-size": "11", dy: "8", dx: "4" });
-    b += legend(stages.filter((st) => S.hourly.some((h) => h.stages[st.key] > 0)).map((st) => [col[st.key], st.label]), p.l, H - 14);
+    b += legend(stages.filter((st) => S.hourly.some((h) => h.stages[st.key] > 0)).map((st) => [col[st.key], st.label]), p.l, H - (hasClosed ? 34 : 14));
+    if (hasClosed) b += `<rect x="${p.l}" y="${H - 24}" width="12" height="12" fill="none" stroke="${P.muted}" stroke-dasharray="3 2"/>` + T(p.l + 18, H - 14, "Station closed or disabled — not counted as starvation", { fill: P.muted, "font-size": "13" });
     return { w: W, h: H, body: b, label: "Station waiting by hour and stage" };
   }
 
@@ -432,8 +435,8 @@
         { v: num(st.to_station.pct, 0), u: "%", l: "of that with the next robot already carrying the tote" },
         { v: num(st.no_task.pct, 0), u: "%", l: "before the next task was even created" },
         { v: num(ctx.dispatch.pct, 0), u: "%", l: "of starved moments had a free K50 and a ready tote" },
-      ],
-      data: () => ({ handovers: S.handovers, starved: S.starved, starved_pct: S.starved_pct, wait_h: S.wait_h, stages: S.stages, context: S.context }),
+      ].concat(S.closed ? [{ v: num(S.closed.wait_h_full), u: "h", l: `left out: station closed or disabled (${int(S.closed.n_full)} handovers)` }] : []),
+      data: () => ({ handovers: S.handovers, starved: S.starved, starved_pct: S.starved_pct, wait_h: S.wait_h, stages: S.stages, context: S.context, closed: S.closed }),
       explain: () => X.starveTiles(S),
     }));
     s.append(card({ title: "Where the next robot was while the station waited", sub: "share of waiting seconds", chart: () => stageRowsChart(S), minWidth: 700,
@@ -458,15 +461,82 @@
       card({ title: "Time since the station resumed", sub: "after a gap of 10 minutes or more", chart: () => rateBarsChart(S.resume.map((x) => ({ ...x, label: x.band })), "since the station resumed", { color: P.deep }),
         data: () => S.resume, explain: () => X.starveResume() })));
     s.append(para(text.patterns));
+    if (S.pick && S.refill) {
+      s.append(two(
+        card({ title: "Starvation by the pick just released", sub: "operator time of the visit before the handover", chart: () => rateBarsChart(S.pick.bands.map((x) => ({ ...x, label: x.band.replace(" or more", "+") })), "operator time of the visit released", { color: P.steel, w: 640, minN: 30 }),
+          data: () => S.pick, explain: () => X.starvePick(S) }),
+        card({ title: "How soon the next robot gets in", sub: `starved after a pick under ${num(S.refill.pick_max_s, 0)} s · median ${num(S.refill.med, 0)} s`, chart: () => histChart(S.refill.hist, S.refill.w, "seconds, previous arrival → next arrival"),
+          data: () => ({ bin_width_s: S.refill.w, last_bin_is_open: true, counts: S.refill.hist, n: S.refill.n, median_s: S.refill.med, p25_s: S.refill.p25, p75_s: S.refill.p75, pick_under_s: S.refill.pick_max_s }), explain: () => X.starveRefill(S) })));
+      s.append(para(text.picks));
+    }
     s.append(card({
       title: "Starvation by station",
       table: () => ({
-        columns: ["Station", "Handovers", "Starved", "Waiting h", "per handover s", "Carrying the tote", "No task yet", "Usual K50s on the way", "Starved, pipeline under half", "Starved otherwise", "Pickup → arrival s", "Tasks created /h"],
-        rows: S.stations.map((x) => [x.station, int(x.handovers), num(x.starved_pct) + "%", num(x.wait_h), num(x.wait_per_s, 2), num(x.stages.to_station, 0) + "%", num(x.stages.no_task, 0) + "%", x.en_route_typical == null ? "–" : String(x.en_route_typical), x.starved_pct_low == null ? "–" : num(x.starved_pct_low) + "%", num(x.starved_pct_high) + "%", `${num(x.travel_med, 0)} (p90 ${num(x.travel_p90, 0)})`, num(x.created_per_h)]),
-        flags: S.stations.map((x) => [null, null, null, null, null, null, x.stages.no_task >= 25 ? "over" : null, null, x.starved_pct_low != null && x.starved_pct_high != null && x.starved_pct_low > 1.5 * x.starved_pct_high ? "over" : null, null, null, null]),
+        columns: ["Station", "Handovers", "Starved", "Waiting h", "per handover s", "Carrying the tote", "No task yet", "Usual K50s on the way", "Starved, pipeline under half", "Starved otherwise", "Starved after fast pick", "Starved after steady pick", "Next robot after a starve s", "Pickup → arrival s", "Tasks created /h", "Closed h"],
+        rows: S.stations.map((x) => [x.station, int(x.handovers), num(x.starved_pct) + "%", num(x.wait_h), num(x.wait_per_s, 2), num(x.stages.to_station, 0) + "%", num(x.stages.no_task, 0) + "%", x.en_route_typical == null ? "–" : String(x.en_route_typical), x.starved_pct_low == null ? "–" : num(x.starved_pct_low) + "%", num(x.starved_pct_high) + "%", x.starved_pct_fast_pick == null ? "–" : num(x.starved_pct_fast_pick) + "%", x.starved_pct_steady_pick == null ? "–" : num(x.starved_pct_steady_pick) + "%", num(x.refill_med, 0), `${num(x.travel_med, 0)} (p90 ${num(x.travel_p90, 0)})`, num(x.created_per_h), num(x.closed_h)]),
+        flags: S.stations.map((x) => [null, null, null, null, null, null, x.stages.no_task >= 25 ? "over" : null, null, x.starved_pct_low != null && x.starved_pct_high != null && x.starved_pct_low > 1.5 * x.starved_pct_high ? "over" : null, null, x.starved_pct_fast_pick != null && x.starved_pct_steady_pick != null && x.starved_pct_fast_pick >= 2 * x.starved_pct_steady_pick ? "over" : null, null, null, null, null, null]),
       }),
-      data: () => S.stations, explain: () => X.starveStations(),
+      data: () => S.stations, explain: () => X.starveStations(S),
     }));
+    return s;
+  }
+
+  // ── where a K50 cycle's time goes ──────────────────────────────────────
+  const SEG_COL = () => ({ fetch: P.slate, travel: P.steel, queue: P.bad, at_station: P.amber, return: P.deep });
+
+  /** One 100% bar per row (all stations, then each), split by cycle segment; seconds per cycle on the right. */
+  function segmentRowsChart(C) {
+    const col = SEG_COL(), segs = E.K50_SEGMENTS;
+    const rows = [{ station: "All stations", pct: Object.fromEntries(C.segments.map((x) => [x.key, x.pct])), per_cycle: Object.fromEntries(C.segments.map((x) => [x.key, x.per_cycle_s])), cycle_s: C.cycle_s, bold: true }].concat(C.stations);
+    const W = 900, lw = 110, rw = 80, rowH = 24, top = 6, H = top + rows.length * rowH + 50;
+    let b = "";
+    rows.forEach((row, i) => {
+      const y = top + i * rowH + (i ? 8 : 0);
+      b += T(lw - 8, y + 15, row.station, { "text-anchor": "end", fill: P.ink, "font-size": "12", ...(row.bold ? { "font-weight": "600" } : {}) });
+      let x = lw;
+      for (const sg of segs) {
+        const v = row.pct[sg.key] || 0, w = ((W - lw - rw) * v) / 100;
+        if (w > 0) b += `<rect x="${x}" y="${y + 3}" width="${w}" height="${rowH - 7}" fill="${col[sg.key]}"><title>${esc(row.station)} — ${esc(sg.label)}: ${num(v)}% of the cycle, ${num(row.per_cycle[sg.key], 0)} s</title></rect>`;
+        if (w > 34) b += T(x + w / 2, y + 16, `${num(v, 0)}%`, { "text-anchor": "middle", fill: P.panel, "font-size": "11" });
+        x += w;
+      }
+      b += T(W - rw + 8, y + 15, `${num(row.cycle_s, 0)} s`, { fill: P.muted, "font-size": "12" });
+    });
+    b += legend(segs.map((sg) => [col[sg.key], sg.label]), lw, H - 14);
+    return { w: W, h: H, body: b, label: "Where a K50 cycle's time goes" };
+  }
+
+  /** The cycle-time section — the same cards for a day and for the whole run. */
+  function cycleTimeSection(C, text) {
+    const sg = Object.fromEntries(C.segments.map((x) => [x.key, x]));
+    const s = section("Where a K50 cycle's time goes", `Every K50 cycle split from its allocation to the tote's return to the buffer. Buffer pickup → station arrival is split into travel, at the free-flow pace for that station and buffer aisle, and queueing — the rest. Full-production hours.`);
+    s.append(card({
+      title: "Cycle time, headline",
+      tiles: () => [
+        { v: num(C.cycle_s, 0), u: "s", l: `average K50 cycle, allocation → back in the buffer (${int(C.n)} cycles)` },
+        { v: num(sg.queue.pct, 0), u: "%", l: "of it queueing for the station", tone: sg.queue.pct >= 20 ? "bad" : null },
+        { v: num(C.queue.med, 0), u: "s", l: "median queueing per cycle" },
+        { v: num(C.rate_on_task, 1), u: "/h", l: "cycles per robot-hour on a task" },
+        { v: num(C.rate_no_queue, 1), u: "/h", l: "the same without the queueing" },
+      ],
+      data: () => ({ n: C.n, cycle_s: C.cycle_s, rate_on_task: C.rate_on_task, rate_no_queue: C.rate_no_queue, segments: C.segments.map(({ note, ...x }) => x), queue_median_s: C.queue.med, queue_p90_s: C.queue.p90 }),
+      explain: () => X.cycleTimeTiles(C),
+    }));
+    s.append(card({ title: "Where a K50 cycle's time goes", sub: "share of cycle time · average seconds per cycle on the right", chart: () => segmentRowsChart(C), minWidth: 700,
+      data: () => ({ all: C.segments.map(({ note, ...x }) => x), stations: C.stations }), explain: () => X.cycleTimeSegments(C) }));
+    s.append(para(text));
+    s.append(two(
+      card({ title: "Queueing per cycle", sub: `median ${num(C.queue.med, 0)} s · p90 ${num(C.queue.p90, 0)} s`, chart: () => histChart(C.queue.hist, C.queue_w, "seconds"),
+        data: () => ({ bin_width_s: C.queue_w, last_bin_is_open: true, counts: C.queue.hist, median_s: C.queue.med, p90_s: C.queue.p90 }), explain: () => X.cycleTimeQueue(C) }),
+      card({
+        title: "Cycle time by station",
+        table: () => ({
+          columns: ["Station", "Cycles", "Multi-station", "Cycle s", "Fetch s", "Travel s", "Queueing s", "At station s", "Return s", "Queueing", "Per robot-hour", "Without queueing"],
+          rows: C.stations.map((x) => [x.station, int(x.n), num(x.multi_pct) + "%", num(x.cycle_s, 0), num(x.per_cycle.fetch, 0), num(x.per_cycle.travel, 0), num(x.per_cycle.queue, 0), num(x.per_cycle.at_station, 0), num(x.per_cycle.return, 0), num(x.pct.queue, 0) + "%", num(x.rate_on_task, 1), num(x.rate_no_queue, 1)]),
+          flags: C.stations.map((x) => [null, null, null, null, null, null, null, null, null, x.pct.queue >= 30 ? "over" : null, null, null]),
+        }),
+        data: () => C.stations, explain: () => X.cycleTimeStations(),
+      })));
     return s;
   }
 
@@ -488,6 +558,148 @@
     if (o.xLabel) b += T(W - p.r, H - 4, o.xLabel, { "text-anchor": "end", fill: P.muted });
     if (o.yLabel) b += T(p.l, 12, o.yLabel, { fill: P.muted, "font-size": "11" });
     return { w: W, h: H, body: b, label: o.label || "Bars" };
+  }
+
+  // ── problem locations ──────────────────────────────────────────────────
+  /** After a flagged pickup vs after a clean one: the next pickup by the same slot, tote and robot. */
+  function repeatChart(B) {
+    const groups = [["Same slot", "another tote", B.repeat.slot], ["Same tote", "another slot", B.repeat.tote], ["Same robot", "another slot", B.repeat.robot]];
+    const W = 560, H = 250, p = { l: 46, r: 12, t: 26, b: 58 }, gw = (W - p.l - p.r) / groups.length;
+    const mx = Math.max(1, ...groups.flatMap((g) => [g[2].after_flag_pct || 0, g[2].after_clean_pct || 0])) * 1.15;
+    const Y = (v) => H - p.b - ((H - p.t - p.b) * v) / mx;
+    let b = "";
+    const step = niceStep(mx, 5);
+    for (let v = 0; v <= mx; v += step) b += `<line x1="${p.l}" x2="${W - p.r}" y1="${Y(v)}" y2="${Y(v)}" stroke="${P.rule}"/>` + T(p.l - 6, Y(v) + 4, num(v, 0) + "%", { "text-anchor": "end", fill: P.muted });
+    groups.forEach(([name, sub, g], i) => {
+      const x0 = p.l + i * gw, bw = gw * 0.3;
+      [[g.after_flag_pct, P.bad, "after a flagged pickup", g.after_flag_n], [g.after_clean_pct, P.steel, "after a clean pickup", g.after_clean_n]].forEach(([v, col, lbl, n], j) => {
+        const x = x0 + gw * 0.17 + j * (bw + 6);
+        b += `<rect x="${x}" y="${Y(v || 0)}" width="${bw}" height="${Y(0) - Y(v || 0)}" fill="${col}"><title>${esc(name)} (${esc(sub)}), ${lbl}: ${num(v)}% flagged of ${int(n)}</title></rect>`;
+        b += T(x + bw / 2, Y(v || 0) - 4, num(v) + "%", { "text-anchor": "middle", fill: P.ink, "font-size": "12", "font-weight": "600" });
+      });
+      b += T(x0 + gw / 2, H - p.b + 18, name, { "text-anchor": "middle", fill: P.ink, "font-size": "12", "font-weight": "600" });
+      b += T(x0 + gw / 2, H - p.b + 33, sub, { "text-anchor": "middle", fill: P.muted, "font-size": "11" });
+    });
+    b += legend([[P.bad, "after a flagged pickup"], [P.steel, "after a clean one"]], p.l, H - 4);
+    b += T(p.l, 12, "% of next pickups flagged", { fill: P.muted, "font-size": "11" });
+    return { w: W, h: H, body: b, label: "Does the trouble stay with the slot or the tote?" };
+  }
+
+  /** Problem locations — the same cards for a day and for the whole run. */
+  function faultSection(F, text) {
+    text = text || {};
+    const B = F.buffer, St = F.storage;
+    const s = section("Problem locations", "Do totes from particular places run into trouble? At the K50 buffer, a pickup is flagged when the slot reported that the robot's tries to take the tote went over the limit; in storage, put-aways that failed and totes the ACRs could not take out.");
+    const tiles = [];
+    if (B) tiles.push(
+      { v: num(B.flagged_pct), u: "%", l: `of K50 buffer pickups needed extra tries (${int(B.flagged)} of ${int(B.pickups)})` },
+      { v: int(B.bad_slots.length), u: "", l: `buffer slots flagged far above chance (${num(B.bad_slots_flag_pct, 0)}% of flags)`, tone: B.bad_slots.length ? "bad" : null },
+      { v: int(B.bad_robots.length), u: "", l: `K50s flagged far above chance (${num(B.bad_robots_flag_pct, 0)}% of flags)` });
+    if (St) {
+      const d2 = St.depth[1], all = St.depth[0].failed + d2.failed;
+      tiles.push(
+        { v: all ? num((d2.failed / all) * 100, 0) : "–", u: all ? "%" : "", l: `of failed put-aways at rear (depth-2) slots (${int(all)} failed)` },
+        { v: num(St.stuck_acr_h), u: "h", l: `ACR time on ${int(St.stuck.length)} stuck storage slot${St.stuck.length === 1 ? "" : "s"} (${int(St.stuck_attempts)} failed loads)`, tone: St.stuck_acr_h >= 1 ? "bad" : null });
+    }
+    s.append(card({ title: "Problem locations, headline", tiles: () => tiles, data: () => ({ buffer: B ? { pickups: B.pickups, flagged: B.flagged, flagged_pct: B.flagged_pct, bad_slots: B.bad_slots.length, bad_robots: B.bad_robots.length } : null, storage: St ? { depth: St.depth, stuck_attempts: St.stuck_attempts, stuck_acr_h: St.stuck_acr_h } : null }), explain: () => X.faultTiles(F) }));
+    if (B) {
+      s.append(card({
+        title: "Where pickups need extra tries", sub: `share of K50 buffer pickups flagged, by aisle and bay · blank under ${B.cell_min_n} pickups`, minWidth: 900,
+        chart: () => heatmapChart(B.aisles.map((a) => "aisle " + a), B.bays.map((y, j) => (j % 6 === 0 ? String(y) : "")), B.rate, { cw: 11, chh: 13, lw: 70, warn: true, cap: Math.max(10, Math.ceil(B.base_pct * 3)), fmt: () => "", legendFmt: (v) => num(v, 0) + "%", colTitle: (j) => "bay " + B.bays[j], label: "Flagged pickups by aisle and bay" }),
+        data: () => ({ aisles: B.aisles, bays: B.bays, flagged_pct: B.rate, pickups: B.n, flagged: B.k }), explain: () => X.faultMap(B),
+      }));
+      s.append(para(text.buffer));
+      s.append(two(
+        card({ title: "Slot or tote?", sub: "the next pickup after a flagged one", chart: () => repeatChart(B), data: () => B.repeat, explain: () => X.faultRepeat() }),
+        card({ title: "Flagged pickups by buffer aisle", chart: () => valueBarsChart(B.by_aisle.map((x) => ({ label: String(x.aisle), v: x.pct, tip: `aisle ${x.aisle}: ${num(x.pct)}% of ${int(x.n)} pickups` })), { fmt: (v) => num(v, 0) + "%", xLabel: "buffer aisle", yLabel: "% of pickups flagged", color: P.amber, w: 620 }),
+          data: () => B.by_aisle, explain: () => X.faultAisle() })));
+      s.append(two(
+        card({ title: "Slots flagged far above chance", sub: `${int(B.bad_slots.length)} of ${int(B.slots_read)} slots read`, tall: true,
+          table: () => ({ columns: ["Slot", "Pickups", "Flagged", "Rate", "× usual", "Days flagged"], rows: B.bad_slots.map((x) => [x.slot, int(x.n), int(x.k), num(x.pct) + "%", num(x.times_base, 1) + "×", int(x.days_flagged)]) }),
+          data: () => B.bad_slots, explain: () => X.faultSlots(B) }),
+        card({ title: "K50s flagged far above chance", sub: `${int(B.bad_robots.length)} of ${int(B.robots_read)} robots read`, tall: true,
+          table: () => ({ columns: ["Robot", "Pickups", "Flagged", "Rate", "× usual"], rows: B.bad_robots.map((x) => [x.robot, int(x.n), int(x.k), num(x.pct) + "%", num(x.times_base, 1) + "×"]) }),
+          data: () => B.bad_robots, explain: () => X.faultRobots(B) })));
+      s.append(para(text.robots));
+    }
+    if (St) {
+      s.append(two(
+        card({ title: "Failed put-aways by slot depth", sub: "share of ACR put-aways into storage that failed",
+          chart: () => valueBarsChart(St.depth.map((x) => ({ label: x.depth === "1" ? "front (depth 1)" : "rear (depth 2)", v: x.pct, tip: `${x.depth === "1" ? "front" : "rear"}: ${int(x.failed)} failed of ${int(x.putaways)} put-aways` })), { fmt: (v) => num(v, 2) + "%", yLabel: "% of put-aways failed", color: P.bad, w: 420 }),
+          data: () => St.depth, explain: () => X.faultDepth() }),
+        card({ title: "Stuck storage slots", sub: `${St.stuck_min}+ failed loads in a day`, tall: true,
+          table: () => ({ columns: ["Slot", "Failed loads", "Days", "ACRs (busiest day)", "ACR h", "Tote"], rows: St.stuck.map((x) => [x.loc, int(x.attempts), int(x.days), int(x.robots_max), num(x.acr_h), x.totes.join(", ")]) }),
+          data: () => St.stuck, explain: () => X.faultStuck(St) })));
+      s.append(para(text.storage));
+    }
+    return s;
+  }
+
+  // ── robot health ───────────────────────────────────────────────────────
+  /** Every robot's value, sorted, as thin bars around a median line; outliers in the warning colour. */
+  function rankChart(items, o = {}) {
+    const W = o.w || 620, H = 220, p = { l: 50, r: 12, t: 18, b: 34 }, n = items.length, bw = (W - p.l - p.r) / Math.max(n, 1);
+    const vals = items.map((x) => x.v), lo = Math.min(...vals), hi = Math.max(...vals);
+    const y0 = o.y0 != null ? Math.min(o.y0, lo) : lo - (hi - lo) * 0.1, y1 = hi + (hi - lo) * 0.1 || hi + 1;
+    const Y = (v) => H - p.b - ((H - p.t - p.b) * (v - y0)) / (y1 - y0 || 1);
+    let b = "";
+    const step = niceStep(y1 - y0, 4);
+    for (let v = Math.ceil(y0 / step) * step; v <= y1; v += step) b += `<line x1="${p.l}" x2="${W - p.r}" y1="${Y(v)}" y2="${Y(v)}" stroke="${P.rule}"/>` + T(p.l - 6, Y(v) + 4, (o.fmt || ((x) => num(x, 2)))(v), { "text-anchor": "end", fill: P.muted });
+    items.forEach((x, i) => {
+      const cx = p.l + i * bw, top = Y(Math.max(x.v, y0)), base = Y(y0);
+      b += `<rect x="${cx + bw * 0.1}" y="${top}" width="${Math.max(bw * 0.8, 1)}" height="${Math.max(base - top, 1)}" fill="${x.warn ? P.bad : P.steel}"><title>${esc(x.tip)}</title></rect>`;
+    });
+    if (o.ref != null) b += `<line x1="${p.l}" x2="${W - p.r}" y1="${Y(o.ref)}" y2="${Y(o.ref)}" stroke="${P.ink}" stroke-dasharray="4 3"/>` + T(p.l + 4, Y(o.ref) - 4, o.refLabel || "", { fill: P.ink, "font-size": "11" });
+    b += T(W - p.r, H - 6, o.xLabel || "robots, sorted", { "text-anchor": "end", fill: P.muted });
+    if (o.yLabel) b += T(p.l, 10, o.yLabel, { fill: P.muted, "font-size": "11" });
+    return { w: W, h: H, body: b, label: o.label || "By robot" };
+  }
+
+  /** Robot health — the same cards for a day and for the whole run. */
+  function robotSection(R, text) {
+    text = text || {};
+    const K = R.k50, A = R.acr, many = R.days >= 4;
+    const s = section("Robot health", "Robot by robot: how fast each one works against the usual time for the same work, and whether its faults are its own or the fleet's. A fault kind that piles up on a few robots points at those robots; one spread like chance points at the system or the process.");
+    const bound = R.kinds.filter((k) => k.robot_bound);
+    s.append(card({
+      title: "Robot health, headline",
+      tiles: () => [
+        { v: K.robots ? `${num(K.cph_p5, 1)}–${num(K.cph_p95, 1)}` : "–", u: "/h", l: "K50 cycles per hour on a task, 5th–95th percentile of robots" },
+        { v: int(K.slow.length + A.slow.length), u: "", l: `robots ${num((R.slow_index - 1) * 100, 0)}%+ slower than usual for their work`, tone: K.slow.length + A.slow.length ? "bad" : null },
+        { v: int(bound.length), u: "", l: `fault kinds that pile up on particular robots (of ${R.kinds.length})` },
+        { v: int(R.robots_flagged), u: "", l: "robots with a fault kind well above their fleet", tone: R.robots_flagged ? "bad" : null },
+      ],
+      data: () => ({ k50: K, acr: A, kinds: R.kinds.length, robot_bound: bound.map((k) => k.key), robots_flagged: R.robots_flagged }),
+      explain: () => X.robotTiles(R),
+    }));
+    const k50rows = R.rows.filter((x) => x.fleet === "K50" && x.cph != null && x.trips >= R.min_trips).sort((a, b) => a.cph - b.cph);
+    const acrRows = R.rows.filter((x) => x.fleet === "ACR" && x.index != null && x.trips >= R.min_trips).sort((a, b) => a.index - b.index);
+    s.append(two(
+      card({ title: "K50 cycles per hour on a task", sub: `${int(k50rows.length)} robots, sorted`, chart: () => rankChart(k50rows.map((x) => ({ v: x.cph, tip: `${x.robot}: ${num(x.cph, 2)} cycles per hour on a task (${int(x.trips)} cycles)` })), { ref: K.cph_med, refLabel: "median", fmt: (v) => num(v, 1), yLabel: "cycles per hour on a task", label: "K50 cycles per hour by robot" }),
+        data: () => k50rows.map((x) => ({ robot: x.robot, cycles_per_hour_on_task: x.cph, cycles: x.trips })), explain: () => X.robotCph(R) }),
+      card({ title: "ACR handling speed", sub: `load → unload in the buffer · 1 = usual for the rack level`, chart: () => rankChart(acrRows.map((x) => ({ v: x.index, warn: x.index >= R.slow_index, tip: `${x.robot}: ${num(x.index, 3)} × usual (${int(x.trips)} puts)` })), { ref: 1, refLabel: "usual", fmt: (v) => num(v, 2), yLabel: "× usual handling time", label: "ACR handling speed by robot" }),
+        data: () => acrRows.map((x) => ({ robot: x.robot, handling_index: x.index, puts: x.trips })), explain: () => X.robotHandle(R) })));
+    s.append(para(text.perf));
+    s.append(card({
+      title: "Which faults belong to particular robots?",
+      table: () => ({
+        columns: ["Fault", "Fleet", "Events", "Robots with any", "Concentration", ...(many ? ["Same robots, both halves of the run"] : []), "Robots above chance", "Most"],
+        rows: R.kinds.map((k) => [k.label, k.fleet, int(k.events), `${int(k.robots_with)} of ${int(k.robots)}`, num(k.dispersion, 1) + "×", ...(many ? [k.consistency == null ? "–" : num(k.consistency, 2)] : []), int(k.above), k.top.join(", ") || "–"]),
+        flags: R.kinds.map((k) => [null, null, null, null, k.robot_bound ? "over" : null, ...(many ? [k.consistency >= 0.5 ? "over" : null] : []), null, null]),
+      }),
+      data: () => R.kinds, explain: () => X.robotKinds(R),
+    }));
+    s.append(para(text.faults));
+    s.append(two(
+      card({ title: "Robots to check", sub: "a fault kind well above the fleet's rate for the robot's work", tall: true,
+        table: () => ({ columns: ["Robot", "Fleet", "Fault", "Events", "Expected", "× expected"], rows: R.flagged.map((x) => [x.robot, x.fleet, x.label, int(x.events), num(x.expected, 1), num(x.times, 1) + "×"]) }),
+        data: () => R.flagged, explain: () => X.robotFlagged(R) }),
+      card({ title: "Every robot", tall: true,
+        table: () => ({ columns: ["Robot", "Fleet", "Tasks", "Cycles / puts", "Cycles /h on task", "Speed (× usual)", "Faults /1000 tasks", "Most common fault", "Buffer pickups flagged"],
+          rows: R.rows.map((x) => [x.robot, x.fleet, int(x.tasks), int(x.trips), x.cph == null ? "–" : num(x.cph, 2), x.index == null ? "–" : num(x.index, 3), num(x.per_1000_tasks, 1), x.top_fault || "–", x.buffer_flag_pct == null ? "–" : num(x.buffer_flag_pct) + "%"]),
+          flags: R.rows.map((x) => [x.above.length ? "over" : null, null, null, null, null, x.index >= R.slow_index ? "over" : null, null, null, null]) }),
+        data: () => R.rows, explain: () => X.robotRows(R) })));
+    return s;
   }
 
   /** Rack and buffer locations — the same cards for a day and for the whole run. */
@@ -715,9 +927,10 @@
     if (tcol) b += T(lw + cols.length * (cw + gap) + 12, 16, "Target", { fill: P.deep, "font-weight": "700", "font-size": "11" });
     const gid = "g" + ++uid, ly = Hgrid + 16;
     b += `<defs><linearGradient id="${gid}"><stop offset="0" stop-color="${lo}"/><stop offset="1" stop-color="${hi}"/></linearGradient></defs>`;
-    b += T(lw, ly + 9, o.ofGrid ? "0%" : fmtv(vmin), { "text-anchor": "end", fill: P.muted, "font-size": "12", dx: "-6" });
+    const lfmt = o.legendFmt || fmtv;
+    b += T(lw, ly + 9, o.ofGrid ? "0%" : lfmt(vmin), { "text-anchor": "end", fill: P.muted, "font-size": "12", dx: "-6" });
     b += `<rect x="${lw}" y="${ly}" width="180" height="10" rx="2" fill="url(#${gid})"/>`;
-    b += T(lw + 186, ly + 9, o.ofGrid ? "100% of possible" : fmtv(top_) + (o.cap && vmax > o.cap ? "+" : ""), { fill: P.muted, "font-size": "12" });
+    b += T(lw + 186, ly + 9, o.ofGrid ? "100% of possible" : lfmt(top_) + (o.cap && vmax > o.cap ? "+" : ""), { fill: P.muted, "font-size": "12" });
     if (hasTgt) {
       const lx = lw + 250;
       b += `<path d="M${lx},${ly - 1} L${lx + 11},${ly - 1} L${lx + 11},${ly + 10} Z" fill="${P.bad}"/>` +
@@ -811,23 +1024,24 @@
   }
 
   /**
-   * The same budget, read against the targets: target pick, target switch and
-   * the wait the budget can absorb fill exactly up to the target line; beyond
-   * it, the excess pick, excess switch and excess wait, in that order — so the
-   * overrun is split by cause.  Inside the target, the part of an allowance the
-   * station did not use is shown pale.
+   * The same budget, read against the targets.  Each station gets two strips on
+   * one seconds scale: the target (target pick | target switch | buffer — what
+   * the target cycle leaves after them) and what happened (picking | switch |
+   * waiting for robot).  Equal seconds are equal widths on both; past the
+   * target line the actual strip is outlined red.
    */
   function budgetTargetChart(z) {
     const rows = z.rows.filter((r) => r.target_pick_s != null && r.target_switch_s != null);
-    const W = 1000, lw = 96, rw = 230, x0 = lw, x1 = W - rw;
-    const laneEnd = (r) => r.target_pick_s + r.target_switch_s + Math.max(r.wait_allowance_s, 0);
-    const reach = (r) => Math.max(r.budget_s, laneEnd(r)) + Math.max(r.excess_pick_s, 0) + Math.max(r.excess_switch_s, 0) + Math.max(r.excess_wait_s, 0);
-    const maxV = Math.max(...rows.map(reach), ...rows.map((r) => r.target_pick_s + r.target_switch_s)) * 1.04;
+    const W = 1000, lw = 96, rw = 250, x0 = lw, x1 = W - rw;
+    const buffer = (r) => Math.max(r.wait_allowance_s, 0);
+    const targetEnd = (r) => r.target_pick_s + r.target_switch_s + buffer(r);
+    const maxV = Math.max(...rows.map((r) => Math.max(r.budget_s, targetEnd(r), r.cycle_s))) * 1.04;
     const x = (v) => x0 + ((x1 - x0) * v) / maxV;
     const overflow = rows.filter((r) => r.target_overflow_s > 0);
-    const rowH = 38, barH = 22, top = overflow.length ? 92 : 70, H = top + rows.length * rowH + 48;
-    const hatch = "u" + ++uid;
-    let b = `<defs><pattern id="${hatch}" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="${P.panel}"/><line x1="0" y1="0" x2="0" y2="6" stroke="${P.rule}" stroke-width="2.2"/></pattern></defs>`;
+    const rowH = 50, tH = 14, aH = 22, gap = 3, top = overflow.length ? 92 : 70, H = top + rows.length * rowH + 52;
+    const pale = (c) => mix(c, P.panel, 0.45);
+    const bufCol = P.good;
+    let b = "";
     const step = niceStep(maxV, 6);
     for (let v = 0; v <= maxV + 1e-9; v += step) {
       b += `<line x1="${x(v)}" x2="${x(v)}" y1="${top - 8}" y2="${top + rows.length * rowH - 6}" stroke="${P.rule}"/>`;
@@ -839,43 +1053,56 @@
       b += `<rect x="${lx}" y="8" width="${lw_}" height="22" rx="11" fill="${P.deep}"/>` + T(lx + lw_ / 2, 23, lbl, { "text-anchor": "middle", fill: P.panel, "font-weight": "600", "font-size": "12" });
       b += `<line x1="${bx}" x2="${bx}" y1="32" y2="${top + rows.length * rowH - 6}" stroke="${P.deep}" stroke-width="1.5" stroke-dasharray="5 4"/>`;
     }
-    b += T(W - rw + 12, top - 30, "Actual per tote", { fill: P.muted, "font-size": "11", "font-weight": "600" });
+    const rx = W - rw + 12;
+    b += T(rx, top - 30, "Actual", { fill: P.muted, "font-size": "11", "font-weight": "600" });
+    b += T(rx, top - 14, "s per tote", { fill: P.muted, "font-size": "11" }) + T(rx + 74, top - 14, "totes/h", { fill: P.muted, "font-size": "11" });
     if (overflow.length) {
       const lo = Math.min(...overflow.map((r) => r.target_overflow_s)), hi = Math.max(...overflow.map((r) => r.target_overflow_s));
-      b += T(x0, 52, `At ${E.runs(overflow.map((r) => r.station))} the pick and switch targets alone exceed the budget (by ${fix(lo)}${hi > lo ? "–" + fix(hi) : ""} s), so they leave no time for waiting.`, { fill: P.bad, "font-size": "12", "font-weight": "600" });
+      b += T(x0, 52, `At ${E.runs(overflow.map((r) => r.station))} the pick and switch targets alone exceed the target cycle (by ${fix(lo)}${hi > lo ? "–" + fix(hi) : ""} s), so there is no buffer.`, { fill: P.bad, "font-size": "12", "font-weight": "600" });
     }
+    // Bars first, labels after the red outline, so the outline never covers a number.
+    let labels = "";
+    const fits = (txt, w) => txt && w >= txt.length * 6.2 + 6;
+    const seg = (cx, y, w, h, fill, tip, label, ink, alt) => {
+      if (w <= 0) return "";
+      const txt = fits(label, w) ? label : fits(alt, w) ? alt : null;
+      if (txt) labels += T(cx + w / 2, y + h / 2 + 4, txt, { "text-anchor": "middle", fill: ink, "font-size": h < 16 ? "10" : "11", "font-weight": "600", stroke: fill, "stroke-width": "3", "paint-order": "stroke" });
+      return `<rect x="${cx}" y="${y}" width="${w}" height="${h}" fill="${fill}"><title>${esc(tip)}</title></rect>`;
+    };
     rows.forEach((r, i) => {
-      const yy = top + i * rowH, by = yy + (rowH - barH) / 2 - 4;
-      b += T(lw - 10, by + barH / 2 + 5, r.station, { "text-anchor": "end", fill: P.ink, "font-size": "13", "font-weight": "600" });
-      // inside the target: allowance lanes, filled up to what was used
+      const yy = top + i * rowH, ty = yy + 2, ay = ty + tH + gap;
+      b += T(lw - 10, ty + (tH + gap + aH) / 2 + 5, r.station, { "text-anchor": "end", fill: P.ink, "font-size": "13", "font-weight": "600" });
+      // target: pick | switch | buffer
       let cx = x0;
-      const lanes = [["pick", r.target_pick_s, r.pick_s, P.steel, P.panel], ["switch", r.target_switch_s, r.switch_s, P.slate, P.ink], ["wait", Math.max(r.wait_allowance_s, 0), r.wait_s, P.amber, P.ink]];
-      for (const [name, tgt, act, col, ink] of lanes) {
-        const wT = x(tgt) - x0, used = Math.min(act, tgt), wU = x(used) - x0;
-        if (wT <= 0) continue;
-        b += `<rect x="${cx}" y="${by}" width="${wT}" height="${barH}" fill="url(#${hatch})" stroke="${col}" stroke-opacity=".6"><title>${r.station} · ${name} target ${fix(tgt)} s, used ${fix(used)} s</title></rect>`;
-        b += `<rect x="${cx}" y="${by}" width="${Math.max(wU, 0)}" height="${barH}" fill="${col}"><title>${r.station} · ${name}: ${fix(act)} s against a ${fix(tgt)} s target</title></rect>`;
-        if (wT >= 40) b += T(cx + wT / 2, by + barH / 2 + 4, fix(tgt), { "text-anchor": "middle", fill: wU > wT / 2 ? ink : P.ink, "font-size": "11", "font-weight": "600", stroke: wU > wT / 2 ? col : P.panel, "stroke-width": "3", "paint-order": "stroke" });
-        cx += wT;
+      for (const [name, v, col] of [["Target pick", r.target_pick_s, P.steel], ["Target switch", r.target_switch_s, P.slate], ["Buffer", buffer(r), bufCol]]) {
+        const w = x(v) - x0;
+        const lbl = name === "Buffer" ? `buffer ${fix(v)}` : fix(v);
+        b += seg(cx, ty, w, tH, pale(col), `${r.station} · ${name}: ${fix(v)} s per tote${name === "Buffer" ? " — what the target cycle leaves for waiting after the pick and switch targets" : ""}`, lbl, P.ink, fix(v));
+        cx += w;
       }
-      // beyond the target (or beyond the targets, if they overrun it): what each part went over by
-      let ex = x(Math.max(r.budget_s, laneEnd(r)));
-      for (const [name, val, col, ink] of [["pick", r.excess_pick_s, P.steel, P.panel], ["switch", r.excess_switch_s, P.slate, P.ink], ["wait", r.excess_wait_s, P.amber, P.ink]]) {
-        if (!(val > 0)) continue;
-        const w = x(val) - x0;
-        b += `<rect x="${ex}" y="${by}" width="${w}" height="${barH}" fill="${col}" stroke="${P.bad}" stroke-width="1.5"><title>${r.station} · ${name} over target by ${fix(val)} s per tote</title></rect>`;
-        if (w >= 38) b += T(ex + w / 2, by + barH / 2 + 4, "+" + fix(val), { "text-anchor": "middle", fill: ink, "font-size": "11", "font-weight": "700", stroke: col, "stroke-width": "3", "paint-order": "stroke" });
-        ex += w;
+      // actual: picking | switch | waiting
+      cx = x0;
+      const diff = (a, t) => (t == null ? "" : ` (target ${fix(t)} s, ${a >= t ? "+" : "−"}${fix(Math.abs(a - t))})`);
+      for (const [name, v, col, ink, t] of [["Picking", r.pick_s, P.steel, P.panel, r.target_pick_s], ["Switch", r.switch_s, P.slate, P.ink, r.target_switch_s], ["Waiting for robot", r.wait_s, P.amber, P.ink, buffer(r)]]) {
+        const w = x(v) - x0;
+        b += seg(cx, ay, w, aH, col, `${r.station} · ${name}: ${fix(v)} s per tote${diff(v, t)}${name === "Waiting for robot" ? " — against the buffer" : ""}`, fix(v), ink);
+        cx += w;
       }
-      const rx = W - rw + 12;
-      b += T(rx, by + barH / 2 + 5, fix(r.cycle_s) + " s", { fill: P.ink, "font-size": "14", "font-weight": "700" });
+      if (r.cycle_s > r.budget_s) {
+        const ox = x(r.budget_s);
+        b += `<rect x="${ox}" y="${ay - 1}" width="${x(r.cycle_s) - ox}" height="${aH + 2}" fill="none" stroke="${P.bad}" stroke-width="2"><title>${r.station}: ${fix(r.over_s)} s per tote over the ${fix(r.budget_s)} s target</title></rect>`;
+      }
+      b += labels; labels = "";
+      const yv = ay + aH / 2 + 5;
+      b += T(rx, yv, fix(r.cycle_s), { fill: P.ink, "font-size": "14", "font-weight": "700" });
+      b += T(rx + 74, yv, num(r.rate, 0), { fill: r.rate >= r.target ? P.good : P.ink, "font-size": "14", "font-weight": "700" });
       b += r.over_s > 0
-        ? T(rx + 66, by + barH / 2 + 5, `+${fix(r.over_s)} s over`, { fill: P.bad, "font-size": "13", "font-weight": "600" })
-        : T(rx + 66, by + barH / 2 + 5, `${fix(-r.over_s)} s spare`, { fill: P.good, "font-size": "13", "font-weight": "600" });
+        ? T(rx + 132, yv, `+${fix(r.over_s)} s over`, { fill: P.bad, "font-size": "13", "font-weight": "600" })
+        : T(rx + 132, yv, `${fix(-r.over_s)} s spare`, { fill: P.good, "font-size": "13", "font-weight": "600" });
       b += `<line x1="${lw - 90}" x2="${W}" y1="${yy + rowH - 2}" y2="${yy + rowH - 2}" stroke="${P.rule}" stroke-opacity=".5"/>`;
     });
-    b += legend([[P.steel, "Picking"], [P.slate, switchLegend(rows)], [P.amber, "Waiting for robot"], [null, "Target not used", hatch]], x0, H - 26);
-    b += T(x0, H - 6, "Left of the target line: each part's target, filled as far as it was used. Right of it: how far each part went over, outlined red.", { fill: P.muted, "font-size": "11" });
+    b += legend([[P.steel, "Picking"], [P.slate, switchLegend(rows)], [P.amber, "Waiting for robot"], [pale(bufCol), "Buffer"]], x0, H - 28);
+    b += T(x0, H - 8, "Top strip of each station: the target — pick, switch and the buffer left for waiting. Bottom strip: what happened. Outlined red: past the target.", { fill: P.muted, "font-size": "11" });
     return { w: W, h: H, body: b, label: `Time budget against targets, ${z.zone}` };
   }
 
@@ -949,7 +1176,7 @@
       data: () => ({ zone: z.zone, view: budgetMode, full_hours: D.budget.full_hours, door_s: door,
         stations: z.rows.map((r) => ({ station: r.station, target_per_h: r.target, budget_s: r.budget_s,
           pick_s: r.pick_s, switch_s: r.switch_s, wait_s: r.wait_s, cycle_s: r.cycle_s, over_s: r.over_s,
-          target_pick_s: r.target_pick_s, target_switch_s: r.target_switch_s, wait_allowance_s: r.wait_allowance_s,
+          target_pick_s: r.target_pick_s, target_switch_s: r.target_switch_s, buffer_s: r.wait_allowance_s,
           excess_pick_s: r.excess_pick_s, excess_switch_s: r.excess_switch_s, excess_wait_s: r.excess_wait_s, actual_per_h: r.rate })) }),
       explain: () => (budgetMode === "targets" ? X.budgetTargets(z) : X.budgetChart(z, D)),
       fill: (body) => {
@@ -1200,6 +1427,7 @@
   const SUMMARY_CATEGORIES = [
     { key: "trends", title: "Trends", def: "Each day against the others: the headline numbers, every station and every hour." },
     { key: "starvation", title: "Starvation", def: "Why stations wait for robots, pooled over every day of the run." },
+    { key: "robots", title: "Robots", def: "Where the K50s' cycle time goes, and each robot's speed and faults, pooled over every day of the run." },
     { key: "locations", title: "Rack and buffer locations", def: "Where totes come from in the rack and the buffer, pooled over every day of the run." },
   ];
 
@@ -1322,6 +1550,8 @@
         card({ title: "ACRs", sub: "puts + stores per active hour", tall: true, table: () => ({ columns: ["Robot", "Puts", "Stores", "Relocs", "Active h", "Per h"], rows: d.acr_robots.map((r) => [r[0], int(r[1]), int(r[2]), int(r[3]), String(r[4]), num(r[5], 2)]) }), data: () => d.acr_robots.map((r) => ({ robot: r[0], puts: r[1], stores: r[2], relocations: r[3], active_hours: r[4], per_hour: r[5] })), explain: () => X.acrTable() })));
       add("robots", sCy);
     }
+    if (D.k50_time && D.k50_time.n) add("robots", cycleTimeSection(D.k50_time, D.text.k50_time));
+    if (D.robots && D.robots.rows.length) add("robots", robotSection(D.robots, D.text.robots));
 
     if (D.starve && D.starve.handovers) add("starvation", starveSection(D.starve, D.text.starve));
     if (D.multi && D.multi.handovers) add("starvation", multiSection(D.multi, D.text.multi));
@@ -1420,6 +1650,7 @@
     }
 
     if (D.spatial) add("locations", spatialSection(D.spatial, D.text.spatial));
+    if (D.faults) add("locations", faultSection(D.faults, D.text.faults));
 
     // What limits the stations
     if (D.hours.length >= 3) {
@@ -1435,6 +1666,7 @@
       { key: "visits", label: "Totes presented", note: "Robot arrivals per station per hour.", grid: d.hm_visits, fmt: (x) => int(x) },
       { key: "op", label: "Median operator time", note: "Median seconds a tote is pickable, by hour of arrival. The colour scale stops at 60 s.", grid: d.hm_op_med, cap: 60, unit: "s" },
       { key: "sw", label: "Median switch time", note: `Median seconds from release to the next robot arriving${doorTxt}, by hour of the first robot's arrival. The colour scale stops at 10 s.`, grid: D.hm_sw_med, cap: 10, unit: "s" },
+      { key: "swmean", label: "Average switch time", note: `Average seconds from release to the next robot arriving${doorTxt}, by hour of the first robot's arrival. Pulled up by long waits for a robot, unlike the median. The colour scale stops at 20 s.`, grid: D.hm_sw_mean, cap: 20, unit: "s" },
       { key: "gt10", label: "Switches over 10 s", note: "Percent of handovers where the next robot took more than 10 s — a sign the station was waiting for work.", grid: D.hm_sw_gt10, cap: 100, warn: true, fmt: (x) => num(x, 0) + "%" },
       { key: "possible", label: "Presented vs possible", note: "Totes presented, and how many were possible in that hour had the average pick taken the station's target pick time — with the switch and waiting as they actually were. Colour is the share of possible achieved.", grid: d.hm_visits, ofGrid: D.hm_possible, cw: 50, chh: 32 },
       { key: "util", label: "Time pickable", note: "Percent of the hour a tote was at the station and pickable. The rest is the switch (door included) or waiting. The Target column is the share a station needs to hit its target; marked cells fall short of it.", grid: D.hm_util, cap: 100, fmt: (x) => num(x, 0) + "%", targets: D.stations.map((t) => t.target_util) },
@@ -1479,11 +1711,11 @@
         card({
           title: "What each fix would be worth", sub: z.zone,
           table: () => ({
-            columns: ["Station", "Target /h", "Actual /h", "Target pick s", "Target switch s", "Wait allowed s", "Wait actual s", "No waiting", "Picks within allowance", "Both"],
+            columns: ["Station", "Target /h", "Actual /h", "Target pick s", "Target switch s", "Buffer s", "Wait actual s", "No waiting", "Picks within allowance", "Both"],
             rows: rows.map((r) => [r.station, num(r.target, 0), num(r.rate, 0), fix(r.target_pick_s) + (r.pick_from === "set" ? "" : "*"), fix(r.target_switch_s) + (r.switch_from === "set" ? "" : "*"), fix(r.wait_allowance_s), fix(r.wait_s), num(r.rns, 0), num(r.rpb, 0), num(r.both, 0)]),
             flags: rows.map((r) => [null, null, r.rate >= r.target ? "spare" : "over", null, null, null, r.wait_allowance_s != null && r.wait_s > Math.max(r.wait_allowance_s, 0) ? "over" : "spare", null, null, null]),
           }),
-          data: () => rows.map((r) => ({ station: r.station, target: r.target, actual: r.rate, wait_allowed_s: r.wait_allowed_s, wait_actual_s: r.wait_s, no_waiting: r.rns, picks_within_allowance: r.rpb, both: r.both, pick_allowance_s: r.pick_allow_s })),
+          data: () => rows.map((r) => ({ station: r.station, target: r.target, actual: r.rate, target_pick_s: r.target_pick_s, target_switch_s: r.target_switch_s, buffer_s: r.wait_allowance_s, wait_actual_s: r.wait_s, no_waiting: r.rns, picks_within_allowance: r.rpb, both: r.both, pick_allowance_s: r.pick_allow_s })),
           explain: () => X.budgetWhatIf(z),
         }),
         scatterCard(z, "scatter-" + slug(z.zone)));
@@ -1556,6 +1788,9 @@
     if (S.starve && S.starve.handovers) add("starvation", starveSection(S.starve, S.text.starve));
     if (S.multi && S.multi.handovers) add("starvation", multiSection(S.multi, S.text.multi));
     if (S.spatial) add("locations", spatialSection(S.spatial, S.text.spatial));
+    if (S.faults) add("locations", faultSection(S.faults, S.text.faults));
+    if (S.k50_time && S.k50_time.n) add("robots", cycleTimeSection(S.k50_time, S.text.k50_time));
+    if (S.robots && S.robots.rows.length) add("robots", robotSection(S.robots, S.text.robots));
 
     const sS = section("By station, across the days", "One row per station, one column per day — so a station that drifts stands out from one that was always slow.");
     sS.append(tabbedCard({
@@ -1566,6 +1801,15 @@
     }));
     sS.append(para(S.text.stations));
     add("trends", sS);
+
+    const sSw = section("Average switch time by station and hour", `Every day pooled: all switch seconds in that station-hour ÷ its handovers, each station with its own door seconds.`);
+    sSw.append(card({
+      title: "Average switch time by station and hour", sub: `${S.days.length} days pooled · seconds`, minWidth: 760,
+      chart: () => heatmapChart(S.stations, R.hours.map(hh), S.hm_sw_mean, { cap: 20, colTitle: (j) => hh(j) + ":00", label: "Average switch time by station and hour" }),
+      data: () => ({ metric: "Average switch time", unit: "s", days: S.days, stations: S.stations, hours: R.hours, grid: S.hm_sw_mean }),
+      explain: () => X.sumSwitchHour(),
+    }));
+    add("trends", sSw);
 
     const sR = section("By hour, across the days", "One row per hour of the day, one column per day — the shift pattern, and whether it held.");
     sR.append(tabbedCard({
@@ -1728,6 +1972,7 @@
     starveTiles: (S) => `<ul><li><b>Handover</b>: a robot's release at a station (<code>will leave</code>) and the next robot's arrival there (<code>CALLBACK_OF_ROBOT_REACH_STATION</code>). Stand-downs over ${C.max_switch_s / 60} minutes are left out; full-production hours only.</li>
       <li><b>Waiting</b> = <code>max(0, gap − the station's median gap)</code> — the hour budget's waiting share. It does not move with the door setting.</li>
       <li><b>Starved</b>: waiting over ${num(S.starved_s, 1)} s.</li>
+      <li><b>Left out — station closed or disabled</b>: handovers whose leaving robot was held over ${S.closed ? num(S.closed.hold_s / 60, 0) : "10"} minutes (a break or shift change; the log shows every station released in the same second afterwards), or during whose gap a task bound for the station was refused with <code>DISABLED_TARGET</code> (<code>CALLBACK_OF_TASK_EXCEPTION</code>). They are not starvation and are in none of the figures here.</li>
       <li>The other figures are explained on their own charts below.</li></ul>`,
     spatialTiles: () => `<ul><li><b>Put</b>: an ACR's load from a storage slot paired with its unload of that tote into the kubot buffer (<code>…_coop_kubot</code>). Storage and buffer slots are read as <code>HAI-&lt;aisle&gt;-&lt;bay&gt;-&lt;level&gt;_&lt;depth&gt;</code>; the aisle is the first number.</li>
       <li><b>Even share</b> = 100% ÷ the aisles used.</li>
@@ -1749,15 +1994,53 @@
     starveStages: () => `<p>For every handover with waiting, the robot that ended it is traced back through its own timeline: <code>task created</code> (the <code>wmsTask … is created</code> line) → <code>tote ready</code> (an ACR puts it in the buffer; at creation if it was already there) → <code>K50 allocated</code> (<code>CALLBACK_OF_TASK_ALLOCATED</code>) → <code>tote picked up</code> (the K50's buffer load) → <code>arrival</code>.</p>
       <p>The station waits from the release plus its usual handover until that arrival. Each second of the wait is charged to the stage the robot was in at that second, so the stages add up exactly to the waiting. A robot on the second or later station of a multi-station cycle is charged to <b>at another station</b>. A missing step (no ACR leg, say) is a zero-length stage.</p>
       <p>Read it as: <b>carrying the tote</b> — work and robot were there, the robot was not close enough; <b>K50 to the buffer / tote ready</b> — allocated too late; <b>waiting on an ACR</b> — supply; <b>no task yet</b> — the station had no more work. Bar ends show the hours of waiting.</p>`,
-    starveHours: (S) => `<p>The same stages, in hours of station waiting, for each hour of the day (by the hour of the release)${S.days > 1 ? ", summed over the days" : ""}. All hours are shown, not only full-production ones.</p>`,
+    starveHours: (S) => `<p>The same stages, in hours of station waiting, for each hour of the day (by the hour of the release)${S.days > 1 ? ", summed over the days" : ""}. All hours are shown, not only full-production ones.</p><p>Dashed outlines on top: gaps after a station was closed (its robot held over ${S.closed ? num(S.closed.hold_s / 60, 0) : "–"} minutes) or disabled — shown for scale, but not starvation and in none of the stages.</p>`,
     starveEnRoute: () => `<p>At each release, the K50s already allocated to that station (<code>CALLBACK_OF_TASK_ALLOCATED</code> naming it) that had not yet arrived there. Each bar is the share of handovers that then starved. Hollow bars have fewer than 30 handovers.</p><p>All stations are pooled, so the slow stations, which have few robots heading to them, sit on the left. The station table compares each station with its own usual pipeline instead.</p>`,
     starveTravel: (S) => `<p>Seconds from the K50's buffer pickup to its arrival at the first station of its cycle, in ${S.travel_w} s bins (the last bin collects the rest), arrivals in full-production hours. It includes any queueing in front of the station.</p><p>Robots that ended a starved wait: median ${num(S.travel.starved_med, 0)} s; all others: ${num(S.travel.other_med, 0)} s. Allocation → pickup (empty travel): median ${num(S.travel.empty_med, 0)} s, p90 ${num(S.travel.empty_p90, 0)} s.</p>`,
     starveContext: () => `<p>At the moment each starved station began to wait: the K50s <b>between tasks</b> (free; under 5 minutes since their last task — robots away are not counted), and the totes for that station <b>ready in the buffer with no K50 allocated</b>.</p><ul>${E.CONTEXT_KINDS.map((k) => `<li><b>${esc(k.label)}</b>: ${esc(k.note)}.</li>`).join("")}</ul><p>A free K50 and a ready tote at the same moment is work dispatch could have sent sooner — or a station at its slot limit.</p>`,
     starvePace: () => `<p>For each release, the mean operator time of that visit and the two before it at the station, as a share of the station's median operator time for the day. Under 100% means the operator had been picking faster than usual. Bars are the share of handovers that then starved.</p>`,
     starveResume: () => `<p>Minutes from the station resuming — its first arrival of the day, or its first arrival after a gap of 10 minutes or more — to the release. Bars are the share of handovers that starved. High bars on the left are a ramp-up effect: the robot pipeline has to refill after a stand-down.</p>`,
-    starveStations: () => `<ul><li><b>Carrying the tote / No task yet</b>: share of the station's waiting in those stages (no task highlighted at 25% or more — short of work).</li>
+    sumSwitchHour: () => `<p><b>Switch</b> = <code>next arrival at the station − release</code> (<code>will leave</code> → <code>CALLBACK_OF_ROBOT_REACH_STATION</code>) + the station's door seconds (0 for stations without a door, and on days the doors were off). Gaps over ${C.max_switch_s / 60} minutes are stand-downs and left out.</p>
+      <p>Each cell pools every day of the run: the sum of switch seconds of handovers whose first robot arrived in that hour, ÷ the number of those handovers. So a busy day weighs more than a quiet one. The colour scale stops at 20 s; blank cells had no handovers.</p>`,
+    robotTiles: (R) => `<ul><li><b>Cycles per hour on a task</b> (K50): the robot's cycles ÷ the hours from each cycle's allocation to its tote back in the buffer. Time between tasks and away is not in it.</li>
+      <li><b>Slower than usual</b>: the robot's speed index is ${num(R.slow_index, 2)} or more, with ${R.min_trips}+ trips. K50: Σ its return trips (last release → tote back in the buffer) ÷ Σ the day's mean return for the same station and buffer aisle. ACR: Σ its handling (storage load → buffer unload) ÷ Σ the day's mean for the same rack level. Each trip is first capped at ${num(R.speed_cap, 0)}× its group's median, so one jammed trip does not decide a robot; over the whole fleet the index averages 1. The return trip is used for K50s because queueing at the stations does not reach it.</li>
+      <li><b>Fault kinds</b>: explained on the table below.</li></ul>`,
+    robotCph: (R) => `<p>Each K50 with ${R.min_trips}+ cycles: cycles × 3600 ÷ the seconds from each cycle's allocation to its tote back in the buffer. The dashed line is the median robot. Most of a cycle is set by the stations (queueing, picking), so this spreads little unless a robot is genuinely slow.</p>`,
+    robotHandle: (R) => `<p>Each ACR with ${R.min_trips}+ puts: Σ its handling seconds (storage load → buffer unload) ÷ Σ the day's mean handling for the same rack level, each put capped at ${num(R.speed_cap, 0)}× the level's median. 1 = usual; red at ${num(R.slow_index, 2)}× or more.</p>`,
+    robotKinds: (R) => `<p>Each fault kind (<code>CALLBACK_OF_ROBOT_ABNORMAL</code> by its message, <code>CALLBACK_OF_TASK_SUSPENDED</code> by its message, <code>CALLBACK_OF_TOTE_LOAD_FAILED</code>, <code>CALLBACK_OF_TASK_CANCELLED</code>) is read within the fleet that has it. Each robot's <b>expected</b> count = the kind's total × the robot's share of the fleet's tasks (<code>CALLBACK_OF_TASK_ALLOCATED</code>).</p>
+      <ul><li><b>Concentration</b> = Σ (events − expected)² ÷ expected, ÷ (robots − 1): about 1× when the kind falls on robots by chance; ${R.dispersion_cut}× or more (highlighted) means it piles up on particular robots.</li>
+      ${R.days >= 4 ? "<li><b>Same robots, both halves of the run</b>: rank correlation of each robot's rate on alternate days. Near 1 = the same robots every time, a robot trait; near 0 = no lasting pattern.</li>" : ""}
+      <li><b>Robots above chance</b>: ${R.min_events}+ events, ${R.min_times}× or more expected, and a Poisson tail below ${R.alpha} ÷ the robots tested.</li>
+      <li>Failed loads at a stuck storage slot (5+ in a day) are left out — the slot is the problem there, not whichever robot was sent (${int(R.stuck_left_out)} left out).</li></ul>`,
+    robotFlagged: () => `<p>Robot and fault kind pairs above chance (see the table above): its events, what its share of the fleet's tasks would give it, and the ratio. A robot listed for a hardware fault (chassis, lift, box dropped) is worth a maintenance check; one listed for "could not put the tote down" fails put-aways other robots manage.</p>`,
+    robotRows: (R) => `<ul><li><b>Tasks</b>: <code>CALLBACK_OF_TASK_ALLOCATED</code> to the robot. <b>Cycles / puts</b>: K50 buffer → station → buffer cycles, or ACR storage → buffer puts.</li><li><b>Speed (× usual)</b>: see the headline (highlighted at ${num(R.slow_index, 2)}×). <b>Faults /1000 tasks</b>: every fault kind together.</li><li><b>Buffer pickups flagged</b> (K50): its pickups needing extra tries (see Problem locations). Robots highlighted have a fault kind above chance.</li></ul>`,
+    faultTiles: (F) => `<ul><li><b>Flagged pickup</b>: a K50's load from the haiflex buffer (<code>CALLBACK_OF_TOTE_LOADED_BY_ROBOT</code>, <code>…_coop_haiflex</code>) that a <code>CALLBACK_OF_LOCATION_ABNORMAL</code> with <code>LOAD_FAILED_COUNT_EXCEEDED_THE_LIMIT</code> for the same tote and slot preceded by up to 10 minutes. The robot's tries to take the tote went over the limit — a slot marker or tote label it could not read, or a tote it could not line up with — and it then succeeded.</li>
+      <li><b>Far above chance</b>: a one-sided binomial test of the slot's (or robot's) flagged pickups against the run's flag rate, Bonferroni-corrected for the number tested (p &lt; ${F.buffer ? F.buffer.alpha : 0.05} ÷ that number). Slots need ${F.buffer ? F.buffer.slot_min_n : 20}+ pickups and robots ${F.buffer ? F.buffer.robot_min_n : 50}+ to be read.</li>
+      <li><b>Failed put-away</b>: <code>LOCATION_ABNORMAL</code> <code>UNLOAD_FAILED_COUNT_EXCEEDED_THE_LIMIT</code> or <code>CALLBACK_OF_TASK_SUSPENDED</code> "hooked failed, fail to put the box" at a storage slot (<code>HAI-a-b-l_d</code>, not a buffer).</li>
+      <li><b>Stuck storage slot</b>: ${F.storage ? F.storage.stuck_min : 5}+ <code>CALLBACK_OF_TOTE_LOAD_FAILED</code> at one storage slot in a day. <b>ACR time</b> = Σ the failing robot's allocation to that task → the failure (attempts over 30 minutes not counted).</li></ul>`,
+    faultMap: (B) => `<p>Each cell is one buffer slot (the K50 buffer is a single level, one deep, so aisle × bay is the slot): its flagged pickups ÷ its pickups. Blank: under ${B.cell_min_n} pickups. The colour scale stops at ${num(Math.max(10, Math.ceil(B.base_pct * 3)), 0)}% (about three times the usual rate of ${num(B.base_pct, 1)}%). Hover a cell for its bay.</p><p>Isolated hot cells are single slots; blocks of hot cells across neighbouring aisles and bays point at something physical in that part of the rack.</p>`,
+    faultRepeat: () => `<p>Each pickup is paired with the next pickup by the same slot (a different tote), by the same tote (from a different slot), and by the same robot (from a different slot), on the same day. Bars are the share of those next pickups that were flagged, after a flagged pickup and after a clean one.</p><p>If the trouble belonged to the slot, the slot's next pickup would be flagged more often after a flag; if it belonged to the tote (a bad label), the tote's next pickup elsewhere would.</p>`,
+    faultAisle: () => `<p>Flagged pickups ÷ pickups, all slots of each buffer aisle (the first number of <code>HAI-&lt;aisle&gt;-&lt;bay&gt;-01_1_coop_haiflex</code>).</p>`,
+    faultSlots: (B) => `<p>Slots with ${B.slot_min_n}+ pickups whose flagged share is far above the usual ${num(B.base_pct, 1)}% (binomial test, Bonferroni over the ${int(B.slots_read)} slots read). <b>× usual</b> = the slot's rate ÷ the usual rate. <b>Days flagged</b>: days with at least one flagged pickup there — a slot flagged every day is a fixed fault, not bad luck.</p>`,
+    faultRobots: (B) => `<p>K50s with ${B.robot_min_n}+ buffer pickups whose flagged share is far above the usual ${num(B.base_pct, 1)}%. Robots pick up from every part of the buffer, so a robot high everywhere points at the robot (its camera or scanner), not the slots.</p>`,
+    faultDepth: () => `<p>ACR put-aways into storage (unloads at <code>HAI-a-b-l_1</code> front or <code>…_2</code> rear slots) and the failed ones (see the headline), by depth. A rear slot is reached past the front one.</p>`,
+    faultStuck: (St) => `<p>Storage slots with ${St.stuck_min}+ failed loads (<code>CALLBACK_OF_TOTE_LOAD_FAILED</code>) in a day: one tote the ACRs could not take out, retried again and again by different robots. <b>ACR h</b>: the failing robots' allocation → failure time, summed. <b>ACRs (busiest day)</b>: distinct robots that tried on its busiest day.</p>`,
+    starvePick: (S) => `<p>Each handover by the operator time of the visit just released (arrival → <code>will leave</code>, as logged). Bars are the share of handovers that then starved; hollow bars have fewer than 30 handovers.</p>
+      <p>A fast pick leaves the next robot less time to move up to the station. <b>Fast</b> = under ${S.pick.fast_s} s, <b>steady</b> = ${S.pick.steady_s[0]}–${S.pick.steady_s[1]} s (very long picks are left out of that comparison: they are mostly the slow stations and interrupted picks).</p>`,
+    starveRefill: (S) => `<p>For starved handovers after a pick under ${num(S.refill.pick_max_s, 0)} s: seconds from the previous robot's arrival to the next robot's arrival, in ${num(S.refill.w, 0)} s bins (the last bin collects the rest).</p>
+      <p>When no robot is waiting at the station, this is how soon one gets in after the previous one arrived — the fastest the station can be fed in that state. A pick shorter than this minus the usual handover always starves. Longer picks are left out, because after one the next robot has had time and a late arrival is a supply matter.</p>`,
+    cycleTimeTiles: (C) => `<ul><li><b>K50 cycle</b>: a buffer load (<code>…_coop_haiflex</code>) paired with the robot's next unload of that tote in the buffer, with one or more station arrivals between. Its start is the K50's <code>CALLBACK_OF_TASK_ALLOCATED</code> for that task (cycles with none under 30 minutes before the pickup are left out: ${int(C.no_alloc)}).</li>
+      <li>Cycles whose first station arrival falls in a full-production hour.</li>
+      <li><b>Per robot-hour on a task</b> = <code>cycles × 3600 ÷ Σ cycle seconds</code>. <b>Without the queueing</b> takes the queueing seconds out of that sum. Time between tasks and away is not in either; the whole-day rate in "Robot cycles per hour" counts every hour a robot was active.</li></ul>`,
+    cycleTimeSegments: (C) => `<ul>${E.K50_SEGMENTS.map((x) => `<li><b>${esc(x.label)}</b>: ${esc(x.note)}.</li>`).join("")}</ul>
+      <p><b>Free-flow trip</b>: for each station and buffer aisle (the first number of <code>HAI-&lt;aisle&gt;-…_coop_haiflex</code>), the ${pctl(C.free_flow_q)} percentile of the day's pickup → first arrival times (${int(C.free_flow_min_n)} trips needed, else the station's own ${pctl(C.free_flow_q)} percentile). Travel = <code>min(pickup → arrival, free-flow)</code>; queueing = the rest. That percentile is the trip with little or nothing ahead of it — the log has no positions, so queueing also takes in any slowdown on the way.</p>`,
+    cycleTimeQueue: (C) => `<p>Seconds of queueing per cycle (pickup → first arrival beyond the free-flow trip), in ${num(C.queue_w, 0)} s bins; the last bin collects the rest.</p>`,
+    cycleTimeStations: () => `<p>Per first station of the cycle: average seconds per cycle in each segment, the share queueing (highlighted at 30% or more), and the cycle rate per robot-hour on a task with and without the queueing.</p>`,
+    starveStations: (S) => `<ul><li><b>Carrying the tote / No task yet</b>: share of the station's waiting in those stages (no task highlighted at 25% or more — short of work).</li>
       <li><b>Usual K50s on the way</b>: median count at a release. <b>Starved, pipeline under half</b>: share of handovers that starved when fewer than half that number were on the way; <b>otherwise</b>: the rest. Highlighted when 1.5× or more.</li>
       <li><b>Pickup → arrival</b>: median and p90 seconds, first station of a cycle.</li>
+      <li><b>Starved after fast / steady pick</b>: share of handovers that starved after a pick under ${S.pick ? S.pick.fast_s : "–"} s / of ${S.pick ? `${S.pick.steady_s[0]}–${S.pick.steady_s[1]}` : "–"} s (highlighted at 2× or more). <b>Next robot after a starve</b>: median seconds from the previous arrival to the next, starved handovers after a pick under ${S.refill ? num(S.refill.pick_max_s, 0) : "–"} s.</li>
+      <li><b>Closed h</b>: gaps beyond the usual handover left out of starvation because the station was closed (robot held over ${S.closed ? num(S.closed.hold_s / 60, 0) : "–"} minutes) or disabled (<code>CALLBACK_OF_TASK_EXCEPTION</code> DISABLED_TARGET for a task bound there during the gap), every hour of the day.</li>
       <li><b>Tasks created /h</b>: tasks with that destination created in full-production hours ÷ those hours.</li></ul>`,
     multiTiles: (M) => `<ul><li><b>Handover</b>: one robot released at a station (<code>will leave</code>) and the next robot's arrival there (<code>CALLBACK_OF_ROBOT_REACH_STATION</code>). Stand-downs over ${C.max_switch_s / 60} minutes are left out, and only full-production hours count.</li>
       <li><b>Wait</b> = <code>max(0, gap − the station's median gap)</code>: the gap beyond a normal handover, which is the hour budget's waiting share. It does not move with the door setting.</li>
@@ -1780,6 +2063,7 @@
       visits: `<p>Count of paired visits per station by the hour of arrival.</p>`,
       op: `<p>Median operator time (release − arrival) of the visits arriving in each station-hour. Colour is capped at 60 s; the number shows the true value.</p>`,
       sw: `<p>Median switch time (gap + door) of the handovers whose first robot arrived in each station-hour.</p>${doorClause()}`,
+      swmean: `<p>Average switch time = Σ (gap + door) ÷ handovers, over the handovers whose first robot arrived in each station-hour (gaps over ${C.max_switch_s / 60} minutes are stand-downs and left out). Long waits for a robot pull it up, so where it sits well above the median the station was waiting, not switching. Colour is capped at 20 s; the number shows the true value.</p>${doorClause()}`,
       possible: `<p><b>Presented</b>: paired visits arriving in the hour. <b>Possible</b> = the station's operating time that hour ÷ (target pick + its measured switch and wait per tote that hour), where operating time is its picking + switch + waiting seconds in the hour. In other words: had each pick taken the target time and everything else stayed as it was, this many totes would have been presented. A low share points at pick time; a drop in possible as well points at breaks, starvation or switch.</p><p>The target pick time comes from the Settings page — or, if blank, the station's budget minus its target switch. Stations with no target show presented only.</p>`,
       gt10: `<p>Share of those handovers whose switch (door included) is above 10 s. Raising the door seconds lowers the threshold the measured gap has to cross, so this rises with the door.</p>`,
       util: `<p>Σ <code>(arrival + door → release)</code> for the station, each interval clipped exactly to the hour, ÷ 3,600 s. The door seconds come off the visit that arrived in that hour.</p>${X.targetUtil()}`,
@@ -1792,12 +2076,11 @@
       <li><b>Waiting for robot</b> = Σ the rest of the gap until the next arrival ÷ totes.</li></ul>
       <p>Every interval is clipped to the hour it falls in, so nothing outside the full-production hours leaks in. These are <b>means, not medians</b>: means add up, so picking + switch + waiting is exactly the station's real cycle (3600 ÷ its actual rate) and can be compared with the budget. Medians of the three parts would not sum to anything.</p>
       <p>The hatched part of a bar is the time over budget. ${settingsDoor() ? `The ${settingsDoor()} s door setting moves that much from picking into the switch; the cycle and the overrun do not change.` : ""}</p>`,
-    budgetTargets: (z) => `<p>The same tote cycle, read against each station's targets. Left of the target line, three lanes add up exactly to the budget (3600 ÷ target totes/h):</p>
-      <ul><li><b>Target pick</b> — set on the Settings page, or if blank, whatever the budget leaves after the target switch (so no waiting is allowed).</li>
-      <li><b>Target switch</b> — set on the Settings page, or if blank, the station's measured median switch (door included).</li>
-      <li><b>Wait allowance</b> — the rest: how long a tote can wait for the next robot and still make rate.</li></ul>
-      <p>Each lane is filled as far as the station used it; a pale remainder means it came in under that target. Right of the line, outlined red, is how far each part went <b>over</b> its target, in the same order — pick, switch, wait — so the overrun is split by cause. The parts over and under always net to the station's real overrun (cycle − budget), shown on the right.</p>
-      <p>If the pick and switch targets alone add up to more than the budget, waiting gets no allowance and the difference is reported as the targets' own overrun, not charged to waiting; the chart says so above the bars.</p>
+    budgetTargets: (z) => `<p>The same tote cycle, read against each station's targets. Each station has two strips on one seconds scale, so equal seconds are equal widths:</p>
+      <ul><li><b>Top — the target</b>, adding up to the target cycle (3600 ÷ target totes/h): <b>target pick</b> (set on the Settings page, or if blank, whatever the target cycle leaves after the target switch), <b>target switch</b> (set, or if blank, the station's measured median switch, door included), and the <b>buffer</b> — what is left for waiting for the next robot.</li>
+      <li><b>Bottom — what happened</b>: mean picking, switch and waiting for robot per tote. Their sum is the station's real cycle, 3600 ÷ its actual totes/h.</li></ul>
+      <p>Where the bottom strip runs past the dashed target line it is outlined red: that is the time per tote over target. Hover a part for its seconds against its target. On the right: actual seconds per tote, actual totes per full-production hour (green at or above target), and the time over or spare.</p>
+      <p>If the pick and switch targets alone add up to more than the target cycle, there is no buffer; the chart says so above the bars.</p>
       <p>Values are mean seconds per tote over the full-production hours. In the table, targets marked * are the defaults described above rather than set values.</p>`,
     slotsTable: () => `<p>A task is <b>assigned</b> to a station from the K50's <code>CALLBACK_OF_TASK_ALLOCATED</code> (which names the destination station) until that robot's "will leave" release there — travel, queueing and picking included. The count is taken second by second.</p>
       <ul><li><b>Slot limit</b>: the highest count the station held for at least 10% of production time, provided it is almost never exceeded (under 2% of the time above it). That shape — a pile-up against a ceiling — is what a dispatcher cap looks like; a station that never piles up shows none.</li>

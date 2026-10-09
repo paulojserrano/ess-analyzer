@@ -27,6 +27,11 @@ K50 cycle      buffer pickup → one or more station visits → return to the bu
 multi-station  a cycle whose tote was presented at two or more stations
 starvation     a handover's gap beyond the station's median handover — the
                station waiting for a robot (the hour budget's waiting share)
+closed         a handover after the station was closed (its robot held over
+               CLOSED_HOLD_S) or disabled (DISABLED_TARGET) — reported apart
+               from starvation
+K50 queueing   buffer pickup → arrival beyond the free-flow trip for that
+               station and buffer aisle (FREE_FLOW_Q of the day's trips)
 ACR move       a load paired with the same robot's next unload of that tote:
                storage→buffer = put, buffer→storage = store, else relocation
 aisle          the first number of a rack slot, HAI-<aisle>-<bay>-<level>_<depth>
@@ -41,6 +46,7 @@ import pandas as pd
 
 from config import (
     AWAY_MIN_S,
+    CLOSED_HOLD_S,
     FULL_HOUR_SHARE,
     IDLE_MIN_MINUTES,
     MAX_SWITCH_S,
@@ -51,6 +57,7 @@ from config import (
 from log_parser import (
     BUFFER_ACR,
     BUFFER_K50,
+    DISABLED_TARGET,
     ROLE_ACR,
     ROLE_K50,
     LogData,
@@ -360,6 +367,80 @@ def _cycle_metrics(data: LogData, day: pd.Timestamp, cycles: pd.DataFrame) -> di
     }
 
 
+# ── Where a K50 cycle's time goes ─────────────────────────────────────────────
+
+# The segments of a K50 cycle, in order; they sum to allocation → buffer return.
+K50_SEGMENTS = ("fetch", "travel", "queue", "at_station", "return")
+# Free-flow trip from the buffer to a station: this quantile of the day's
+# pickup → arrival times for that station and buffer aisle (FREE_FLOW_MIN_N
+# trips needed, else the station's own quantile).  Anything above it is queueing.
+FREE_FLOW_Q, FREE_FLOW_MIN_N = 0.10, 20
+QUEUE_HIST_W, QUEUE_HIST_BINS = 10.0, 60
+
+
+def _k50_time(data: LogData, day: pd.Timestamp, cycles: pd.DataFrame, full: list[int]) -> dict | None:
+    """Every K50 cycle split into the time it spends in each segment:
+
+        fetch       allocation → buffer pickup (empty travel to the tote)
+        travel      pickup → first station arrival, up to the free-flow trip
+        queue       the rest of pickup → arrival: waiting its turn at the station
+        at_station  first arrival → last release (a multi-station cycle's
+                    transit between stations included)
+        return      last release → tote back in the buffer
+
+    Cycles whose first arrival falls in a full-production hour and that have a
+    K50 allocation under _ALLOC_LOOKBACK before the pickup.  Sums and counts,
+    so the report can pool days.
+    """
+    c = cycles[cycles["n_st"] >= 1]
+    if c.empty:
+        return None
+    arr = data.arrivals[["ts", "robot", "station"]].rename(columns={"ts": "t_arr"}).sort_values("t_arr")
+    rel = data.releases[["ts", "robot"]].rename(columns={"ts": "t_rel"}).sort_values("t_rel")
+    c = pd.merge_asof(c.sort_values("t_load"), arr, left_on="t_load", right_on="t_arr",
+                      by="robot", direction="forward")
+    c = pd.merge_asof(c.dropna(subset=["t_arr"]).sort_values("t_unload"), rel, left_on="t_unload",
+                      right_on="t_rel", by="robot", direction="backward")
+    c = c[(c["t_arr"] <= c["t_unload"]) & (c["t_rel"] >= c["t_arr"])]
+    al = data.allocations[data.allocations["robot"].isin(data.robots(ROLE_K50))]
+    c = c.merge(al.sort_values("ts").drop_duplicates("task")[["task", "ts"]].rename(columns={"ts": "t_alloc"}),
+                on="task", how="left")
+    sec = lambda a, b: (c[b] - c[a]).dt.total_seconds()
+    c["fetch"], c["carry"] = sec("t_alloc", "t_load"), sec("t_load", "t_arr")
+    c["at_station"], c["return"] = sec("t_arr", "t_rel"), sec("t_rel", "t_unload")
+    no_alloc = ~c["fetch"].between(0, _ALLOC_LOOKBACK.total_seconds())
+
+    # Free-flow trip per station × buffer aisle, from every trip of the day.
+    c["aisle"] = c["from_loc"].str.extract(r"HAI-(\d+)-", expand=False)
+    q = lambda x: x.quantile(FREE_FLOW_Q) if len(x) >= FREE_FLOW_MIN_N else np.nan
+    ff = c.groupby(["station", "aisle"])["carry"].transform(q)
+    ff = ff.fillna(c.groupby("station")["carry"].transform(lambda x: x.quantile(FREE_FLOW_Q)))
+    c["travel"] = np.minimum(c["carry"], ff)
+    c["queue"] = c["carry"] - c["travel"]
+
+    in_day = (c["t_arr"] >= day) & (c["t_arr"] < day + DAY) & c["t_arr"].dt.hour.isin(full)
+    skipped = int((in_day & no_alloc).sum())
+    f = c[in_day & ~no_alloc]
+    if f.empty:
+        return None
+
+    def sums(g) -> dict:
+        return {k: _r(g[k].sum()) for k in K50_SEGMENTS}
+
+    stations = [{"station": st, "n": int(len(g)), "multi": int((g["n_st"] >= 2).sum()), "segments": sums(g)}
+                for st, g in sorted(f.groupby("station"), key=lambda x: natural_key(x[0]))]
+    return {
+        "n": int(len(f)), "multi": int((f["n_st"] >= 2).sum()), "no_alloc": skipped,
+        "full_hours": len(full), "robots": int(f["robot"].nunique()),
+        "segments": sums(f),
+        "queue_hist": _hist(f["queue"], QUEUE_HIST_W, QUEUE_HIST_BINS), "queue_w": QUEUE_HIST_W,
+        "carry_hist": _hist(f["carry"], QUEUE_HIST_W, QUEUE_HIST_BINS),
+        "travel_hist": _hist(f["travel"], QUEUE_HIST_W, QUEUE_HIST_BINS),
+        "free_flow_q": FREE_FLOW_Q, "free_flow_min_n": FREE_FLOW_MIN_N,
+        "stations": stations,
+    }
+
+
 # ── Multi-station visits and station starvation ───────────────────────────────
 
 # Station windows for "does starvation rise when multi-station visits do?".
@@ -371,6 +452,21 @@ MULTI_BANDS = [(0, 0, "none"), (0, 10, "under 10%"), (10, 20, "10–20%"),
 # Handover kinds: does the robot leaving go on to another station, and did the
 # robot arriving come from one?
 HANDOVER_KINDS = ("plain", "out", "in", "both")
+
+
+def _disabled(data: LogData) -> pd.DataFrame:
+    """When each station was reported disabled: ts, station.  A task exception
+    with DISABLED_TARGET names the task; its station is the task's destination."""
+    ex = data.exceptions
+    if ex.empty:
+        return pd.DataFrame(columns=["ts", "station"])
+    ex = ex[ex["message"] == DISABLED_TARGET]
+    dest = data.created.drop_duplicates("task").set_index("task")["dest"]
+    al = data.allocations
+    al = al[al["station"].str.startswith("LABOR", na=False)].drop_duplicates("task")
+    dest = dest.combine_first(al.set_index("task")["station"])
+    out = pd.DataFrame({"ts": ex["ts"].to_numpy(), "station": ex["task"].map(dest).to_numpy()})
+    return out.dropna(subset=["station"])
 
 
 def handovers(data: LogData, v: pd.DataFrame, cycles: pd.DataFrame,
@@ -385,7 +481,9 @@ def handovers(data: LogData, v: pd.DataFrame, cycles: pd.DataFrame,
     stand-downs (gaps over MAX_SWITCH_S) left out.  ``wait`` is the gap beyond
     the station's median handover — the hour budget's waiting share; the
     station is waiting from ``ws`` (release + that median) to ``t_arr``, and is
-    ``starved`` when the wait exceeds *starved_s*.
+    ``starved`` when the wait exceeds *starved_s* — unless the handover is
+    ``closed``: the leaving robot was held over CLOSED_HOLD_S (``held``: a break
+    or shift change), or the station was disabled during the gap (``disabled``).
     ``nxt`` is the arriving visit's row in the returned visits.
     """
     v = v.copy()
@@ -425,7 +523,17 @@ def handovers(data: LogData, v: pd.DataFrame, cycles: pd.DataFrame,
     ho = ho[ok].copy()
     ho["kind"] = np.select([ho["out"] & ho["in"], ho["out"], ho["in"]], ["both", "out", "in"], "plain")
     ho["multi"] = ho["kind"] != "plain"
-    ho["starved"] = ho["wait"] > starved_s
+    ho["held"] = (v["op_s"] > CLOSED_HOLD_S)[ok].to_numpy()
+    ho["disabled"] = False
+    for st, g in _disabled(data).groupby("station"):
+        mask = (ho["station"] == st).to_numpy()
+        if mask.any():
+            ts = np.sort(g["ts"].to_numpy("datetime64[ns]"))
+            lo = np.searchsorted(ts, ho.loc[mask, "t"].to_numpy("datetime64[ns]"), side="left")
+            hi = np.searchsorted(ts, ho.loc[mask, "t_arr"].to_numpy("datetime64[ns]"), side="right")
+            ho.loc[mask, "disabled"] = hi > lo
+    ho["closed"] = ho["held"] | ho["disabled"]
+    ho["starved"] = (ho["wait"] > starved_s) & ~ho["closed"]
     ho.attrs["starved_s"] = starved_s
     return v, ho
 
@@ -530,6 +638,15 @@ RESUME_BANDS = [(0, 5, "under 5 min"), (5, 15, "5–15 min"), (15, 30, "15–30 
                 (30, 60, "30–60 min"), (60, 1e9, "over 1 h")]
 # Free K50s and ready totes at the moment a station starts to starve.
 CONTEXT_KINDS = ("dispatch", "k50", "supply", "neither")
+# The operator time of the visit just released, in bands [lo, hi) seconds.
+PICK_BANDS = [(0, 4, "under 4 s"), (4, 5, "4–5 s"), (5, 6, "5–6 s"), (6, 8, "6–8 s"),
+              (8, 10, "8–10 s"), (10, 12, "10–12 s"), (12, 15, "12–15 s"),
+              (15, 20, "15–20 s"), (20, 30, "20–30 s"), (30, 1e9, "30 s or more")]
+# A starved station's previous arrival → next arrival, in 1 s bins, after a pick
+# under REFILL_PICK_MAX_S: how soon a robot gets in when none is waiting at the
+# station.  After a long pick the next robot has had time; that is supply.
+REFILL_HIST_W, REFILL_HIST_BINS = 1.0, 60
+REFILL_PICK_MAX_S = 12.0
 
 
 def _travel_hist(seconds) -> list[int]:
@@ -545,8 +662,21 @@ def _bands(values: np.ndarray, bands, rows: pd.DataFrame) -> list[dict]:
     return out
 
 
+def _closed_summary(closed: pd.DataFrame, full: list[int]) -> dict:
+    """Handovers left out of starvation: the station closed (robot held) or
+    disabled.  ``wait_s`` is the gap beyond the station's median, as for
+    starvation; ``*_full`` the part in full-production hours."""
+    cf = closed[closed["hour"].isin(full)]
+    return {"n": int(len(closed)), "wait_s": _r(closed["wait"].sum()) or 0.0,
+            "held": int(closed["held"].sum()) if len(closed) else 0,
+            "disabled": int((closed["disabled"] & ~closed["held"]).sum()) if len(closed) else 0,
+            "n_full": int(len(cf)), "wait_s_full": _r(cf["wait"].sum()) or 0.0,
+            "hold_s": CLOSED_HOLD_S}
+
+
 def _starvation(data: LogData, v: pd.DataFrame, ho: pd.DataFrame, day: pd.Timestamp,
-                full: list[int], stations: list[str], k50_idle: np.ndarray | None) -> dict | None:
+                full: list[int], stations: list[str], k50_idle: np.ndarray | None,
+                closed: pd.DataFrame | None = None) -> dict | None:
     """Why stations wait for robots, handover by handover.
 
     1. stages     where the arriving robot was during each second of the wait:
@@ -566,8 +696,15 @@ def _starvation(data: LogData, v: pd.DataFrame, ho: pd.DataFrame, day: pd.Timest
     5. pace       the operator's last few picks against the station's median
     6. demand     tasks created per station per full-production hour
     7. resume     minutes since the station came back from a stand-down
+    8. pick       the operator time of the visit just released, in seconds
+    9. refill     a starved station's previous arrival → next arrival, after a
+                  pick under REFILL_PICK_MAX_S: how soon a robot gets in when
+                  none is waiting at the station
+   10. closed     the handovers left out because the station was closed or
+                  disabled (*closed*, from ``handovers``), apart from starvation
 
-    Sums, counts and histograms only.  Full-production hours, except ``hourly``.
+    *ho* holds the open handovers only.  Sums, counts and histograms only.
+    Full-production hours, except ``hourly`` and ``closed``.
     """
     if ho.empty:
         return None
@@ -651,6 +788,9 @@ def _starvation(data: LogData, v: pd.DataFrame, ho: pd.DataFrame, day: pd.Timest
     resumed = resumed.groupby(v["station"]).ffill()
     ho["pace"] = pace.reindex(ho.index).to_numpy()
     ho["since_min"] = ((ho["t"] - resumed.reindex(ho.index)).dt.total_seconds() / 60).to_numpy()
+    # ── 8. pick and 9. refill
+    ho["prev_op"] = v["op_s"].reindex(ho.index).to_numpy()
+    ho["refill"] = (ho["t_arr"] - v["arr"].reindex(ho.index)).dt.total_seconds().to_numpy()
 
     f = ho[ho["hour"].isin(full)]
 
@@ -678,6 +818,7 @@ def _starvation(data: LogData, v: pd.DataFrame, ho: pd.DataFrame, day: pd.Timest
     cr = data.created
     cr = cr[(cr["ts"] >= day) & (cr["ts"] < day + DAY) & cr["ts"].dt.hour.isin(full)] if not cr.empty else cr
 
+    cl = closed if closed is not None else ho.iloc[:0]
     station_rows = []
     for st in stations:
         g = f[f["station"] == st]
@@ -690,6 +831,11 @@ def _starvation(data: LogData, v: pd.DataFrame, ho: pd.DataFrame, day: pd.Timest
             "en_route_starved": np.bincount(g.loc[g["starved"], "en_route"], minlength=EN_ROUTE_BINS).tolist(),
             "travel_hist": _travel_hist(tr),
             "created": int((cr["dest"] == st).sum()) if not cr.empty else 0,
+            "refill_hist": _hist(g.loc[g["starved"] & (g["prev_op"] < REFILL_PICK_MAX_S), "refill"],
+                                 REFILL_HIST_W, REFILL_HIST_BINS),
+            "pick": _bands(g["prev_op"].to_numpy(), PICK_BANDS, g),
+            "closed_n": int((cl["station"] == st).sum()),
+            "closed_wait_s": _r(cl.loc[cl["station"] == st, "wait"].sum()),
         })
 
     hourly = []
@@ -697,7 +843,8 @@ def _starvation(data: LogData, v: pd.DataFrame, ho: pd.DataFrame, day: pd.Timest
         g = ho[ho["hour"] == h]
         tr = travel_all[first_all["hour"] == h]
         hourly.append({"h": h, **head(g), "stages": stage_sums(g),
-                       "travel_med": _r(tr.median()) if len(tr) else None})
+                       "travel_med": _r(tr.median()) if len(tr) else None,
+                       "closed_s": _r(cl.loc[cl["hour"] == h, "wait"].sum())})
 
     st_f = f[f["starved"]]
     return {
@@ -718,6 +865,11 @@ def _starvation(data: LogData, v: pd.DataFrame, ho: pd.DataFrame, day: pd.Timest
         "travel_w": TRAVEL_HIST_W,
         "pace": _bands(f["pace"].to_numpy(), PACE_BANDS, f),
         "resume": _bands(f["since_min"].to_numpy(), RESUME_BANDS, f),
+        "pick": _bands(f["prev_op"].to_numpy(), PICK_BANDS, f),
+        "pick_edges": [[lo, min(hi, 1e6)] for lo, hi, _ in PICK_BANDS],
+        "refill_hist": _hist(st_f.loc[st_f["prev_op"] < REFILL_PICK_MAX_S, "refill"], REFILL_HIST_W, REFILL_HIST_BINS),
+        "refill_w": REFILL_HIST_W, "refill_pick_max_s": REFILL_PICK_MAX_S,
+        "closed": _closed_summary(cl, full),
         "stations": station_rows,
         "hourly": hourly,
     }
@@ -1285,6 +1437,235 @@ def _spatial(data: LogData, day: pd.Timestamp, cycles: pd.DataFrame | None) -> d
     return out
 
 
+# ── Problem locations ─────────────────────────────────────────────────────────
+
+# A LOCATION_ABNORMAL with this message at a slot: the robot's tries to take the
+# tote from it went over the limit (a slot or marker it could not read or line
+# up with).  At the K50 buffer it comes a few seconds before that tote's load.
+LOAD_FLAG = "LOAD_FAILED_COUNT_EXCEEDED_THE_LIMIT"
+# Messages that mean an ACR could not put a tote away into a storage slot.
+PUT_FAIL = ("UNLOAD_FAILED_COUNT_EXCEEDED_THE_LIMIT", "hooked failed,fail to put the box!")
+# A flag belongs to the next load of that tote from that slot within this window.
+FLAG_WINDOW = pd.Timedelta(minutes=10)
+FLAG_LAG_W, FLAG_LAG_BINS = 1.0, 30
+# A storage slot with this many failed loads in a day is a retry loop.
+STUCK_MIN_ATTEMPTS = 5
+# Allocation → failure longer than this is not counted as the attempt's cost.
+_ATTEMPT_MAX_S = 1800.0
+_SLOT_RE = re.compile(r"HAI-(\d+)-(\d+)-(\d+)_(\d)")
+
+
+def _repeat(g: pd.DataFrame, key: str, other: str) -> list[int]:
+    """[after a flagged pickup: next pickups, flagged; after an unflagged one:
+    next pickups, flagged] — the next pickup by the same *key*, where it was a
+    different *other* (same slot, another tote; same tote, another slot)."""
+    g = g.sort_values("ts")
+    prev = g.groupby(key)["flagged"].shift()
+    ok = prev.notna() & (g.groupby(key)[other].shift() != g[other])
+    after, nxt = prev[ok].astype(bool), g.loc[ok, "flagged"]
+    return [int(after.sum()), int(nxt[after].sum()), int((~after).sum()), int(nxt[~after].sum())]
+
+
+def _faults(data: LogData, day: pd.Timestamp) -> dict | None:
+    """Do totes from particular locations run into trouble?
+
+    1. buffer   every K50 pickup from the haiflex buffer, *flagged* when a
+                LOAD_FLAG for that tote at that slot came within FLAG_WINDOW
+                before it: per slot (aisle × bay — the buffer is one level, one
+                deep), per robot and per hour; and *repeat*, which tells a slot
+                problem from a tote one: is the slot's next pickup (another tote)
+                flagged more often after a flag, or the tote's next pickup
+                (another slot)?
+    2. storage  ACR put-aways into storage by slot depth, and those that failed
+                (PUT_FAIL); failed loads from storage, with the slots retried
+                STUCK_MIN_ATTEMPTS+ times (a stuck tote) and the ACR time spent
+                on the attempts (allocation → failure).
+
+    Sums and counts only, so engine.faultStats() pools a day or the run.
+    """
+    fl = data.faults
+    if fl.empty:
+        return None
+    on_day = lambda ts: (ts >= day) & (ts < day + DAY)                 # noqa: E731
+    te = data.tote_events
+    k50 = data.robots(ROLE_K50)
+    out: dict = {}
+
+    # ── 1. K50 buffer pickups
+    loads = te[(te["kind"] == "load") & te["robot"].isin(k50) & te["loc"].str.contains(BUFFER_K50, na=False)]
+    flags = fl[(fl["kind"] == "abnormal") & (fl["message"] == LOAD_FLAG) & fl["loc"].str.contains(BUFFER_K50, na=False)]
+    if not loads.empty:
+        m = pd.merge_asof(flags.sort_values("ts"), loads[["ts", "tote", "loc"]].rename(columns={"ts": "t_load"}).sort_values("t_load"),
+                          left_on="ts", right_on="t_load", by=["tote", "loc"], direction="forward", tolerance=FLAG_WINDOW)
+        m = m.dropna(subset=["t_load"])
+        per = m.groupby(["t_load", "tote", "loc"]).size().rename("n_flags").reset_index().rename(columns={"t_load": "ts"})
+        k = loads.merge(per, on=["ts", "tote", "loc"], how="left")
+        k["n_flags"] = k["n_flags"].fillna(0).astype(int)
+        k["flagged"] = k["n_flags"] > 0
+        k = k[on_day(k["ts"])]
+        if not k.empty:
+            slot = k["loc"].str.extract(_SLOT_RE)
+            k = k.assign(aisle=pd.to_numeric(slot[0]), bay=pd.to_numeric(slot[1])).dropna(subset=["aisle", "bay"])
+            aisles = sorted(int(a) for a in k["aisle"].unique())
+            bays = sorted(int(b) for b in k["bay"].unique())
+            g = k.groupby(["aisle", "bay"])["flagged"].agg(["size", "sum"])
+            r = k.groupby("robot")["flagged"].agg(["size", "sum"])
+            lag = (m.loc[on_day(m["t_load"]), "t_load"] - m.loc[on_day(m["t_load"]), "ts"]).dt.total_seconds()
+            out["buffer"] = {
+                "pickups": int(len(k)), "flagged": int(k["flagged"].sum()), "flags": int(k["n_flags"].sum()),
+                "aisles": aisles, "bays": bays,
+                # pickups and flagged pickups [aisle][bay], in the order above
+                "n": [[int(g["size"].get((a, b_), 0)) for b_ in bays] for a in aisles],
+                "k": [[int(g["sum"].get((a, b_), 0)) for b_ in bays] for a in aisles],
+                "robots": [[rb, int(r.loc[rb, "size"]), int(r.loc[rb, "sum"])] for rb in sorted(r.index, key=natural_key)],
+                "repeat": {"slot": _repeat(k, "loc", "tote"), "tote": _repeat(k, "tote", "loc"),
+                           "robot": _repeat(k, "robot", "loc")},
+                "lag_hist": _hist(lag, FLAG_LAG_W, FLAG_LAG_BINS), "lag_w": FLAG_LAG_W,
+                "hourly": [[int((k["ts"].dt.hour == h).sum()), int(k.loc[k["ts"].dt.hour == h, "flagged"].sum())] for h in range(24)],
+            }
+
+    # ── 2. storage
+    storage = lambda loc: loc.str.match(r"^HAI-\d+-\d+-\d+_\d$", na=False)      # noqa: E731
+    acr = data.robots(ROLE_ACR)
+    puts = te[(te["kind"] == "unload") & te["robot"].isin(acr) & storage(te["loc"]) & on_day(te["ts"])]
+    pf = fl[storage(fl["loc"]) & fl["message"].isin(PUT_FAIL) & on_day(fl["ts"])]
+    depth = lambda loc: loc.str[-1]                                                # noqa: E731
+    lf = fl[(fl["kind"] == "load_failed") & storage(fl["loc"]) & on_day(fl["ts"])].copy()
+    if not lf.empty:
+        al = data.allocations.rename(columns={"ts": "t_alloc"})[["t_alloc", "robot", "task"]].sort_values("t_alloc")
+        lf = pd.merge_asof(lf.sort_values("ts"), al, left_on="ts", right_on="t_alloc", by=["robot", "task"], direction="backward")
+        lf["cost"] = (lf["ts"] - lf["t_alloc"]).dt.total_seconds().where(lambda s: s.between(0, _ATTEMPT_MAX_S))
+    else:
+        lf["cost"] = pd.Series(dtype=float)
+    stuck = []
+    for loc, g_ in lf.groupby("loc"):
+        if len(g_) >= STUCK_MIN_ATTEMPTS:
+            stuck.append({"loc": loc, "attempts": int(len(g_)), "robots": int(g_["robot"].nunique()),
+                          "totes": sorted(set(g_["tote"]) - {""})[:3], "acr_s": _r(g_["cost"].sum(), 0),
+                          "first": g_["ts"].min().strftime("%H:%M"), "last": g_["ts"].max().strftime("%H:%M")})
+    stuck.sort(key=lambda x: -x["attempts"])
+    sus = fl[(fl["kind"] == "suspended") & on_day(fl["ts"])]
+    out["storage"] = {
+        "putaways": {d_: int((depth(puts["loc"]) == d_).sum()) for d_ in ("1", "2")},
+        "put_failed": {d_: int((depth(pf["loc"]) == d_).sum()) for d_ in ("1", "2")},
+        "failed_loads": int(len(lf)), "failed_load_slots": int(lf["loc"].nunique()),
+        "acr_s": _r(lf["cost"].sum(), 0) or 0.0,
+        "stuck": stuck, "stuck_min": STUCK_MIN_ATTEMPTS,
+        "suspended": {str(msg)[:120]: int(n) for msg, n in sus["message"].value_counts().head(8).items()},
+    }
+    return out if out.get("buffer") or lf.size or len(pf) else None
+
+
+# ── Robot health ──────────────────────────────────────────────────────────────
+
+# Fault kinds per robot: (key, fault kind in LogData.faults, message pattern).
+# The first match wins; the engine holds the labels.
+ROBOT_FAULT_KINDS = (
+    ("chassis", "robot_abnormal", r"chassis"),
+    ("lift", "robot_abnormal", r"\(lift\)"),
+    ("dropped", "robot_abnormal", r"droped|dropped"),
+    ("unreachable", "robot_abnormal", r"not reachable"),
+    ("move_command", "robot_abnormal", r"curveParams|ROBOT_COMMAND"),
+    ("robot_other", "robot_abnormal", r""),
+    ("put_failed", "suspended", r"fail to put the box"),
+    ("no_box", "suspended", r"there is no box|has no detected"),
+    ("suspended_other", "suspended", r""),
+    ("load_failed", "load_failed", r""),
+    ("cancelled", "cancelled", r""),
+)
+# A K50's return trip is compared with the day's mean for the same station and
+# buffer aisle, an ACR's handling with the mean for the same rack level; each
+# trip is capped at SPEED_CAP × that group's median first, so one jammed trip
+# does not decide a robot.  Over the fleet the index averages exactly 1.
+_RETURN_MAX_S, _HANDLE_MAX_ROBOT_S = 600.0, 600.0
+SPEED_CAP = 3.0
+
+
+def _speed(df: pd.DataFrame, col: str, by) -> pd.DataFrame:
+    """Capped seconds (*act*) and the group mean of them (*exp*), per row."""
+    med = df.groupby(by)[col].transform("median")
+    act = np.minimum(df[col], SPEED_CAP * med)
+    return df.assign(act=act, exp=act.groupby([df[b] for b in by]).transform("mean"))
+
+
+def _fault_kind(kind: pd.Series, message: pd.Series) -> pd.Series:
+    out = pd.Series("", index=kind.index, dtype=object)
+    for key, k, pat in ROBOT_FAULT_KINDS:
+        m = (out == "") & (kind == k)
+        if pat:
+            m &= message.str.contains(pat, regex=True, na=False)
+        out[m] = key
+    return out
+
+
+def _robots(data: LogData, day: pd.Timestamp, cycles: pd.DataFrame | None) -> dict | None:
+    """Each robot's work, speed and faults, so the report can tell a robot
+    problem from a system one.
+
+    K50     tasks (allocations), cycles, seconds on those cycles (allocation →
+            buffer return), and return-trip seconds against the day's median for
+            the same station and buffer aisle (*expected*, see SPEED_CAP) — a
+            speed index that queueing at the stations does not reach.
+    ACR     tasks, buffer puts and their handling seconds (load → unload) against
+            the day's median for the same rack level.
+    faults  per kind (ROBOT_FAULT_KINDS), events per robot.  Failed loads at a
+            stuck storage slot (STUCK_MIN_ATTEMPTS+ that day) are left out: the
+            slot is the problem there, not whichever robot was sent.
+
+    Sums and counts only; engine.robotStats() pools days and tests each robot
+    against its fleet, with its tasks as the exposure.
+    """
+    on_day = lambda ts: (ts >= day) & (ts < day + DAY)                 # noqa: E731
+    k50, acr = data.robots(ROLE_K50), data.robots(ROLE_ACR)
+    al = data.allocations[on_day(data.allocations["ts"])]
+    tasks = al.groupby("robot").size()
+    out: dict = {}
+
+    rows = []
+    if cycles is not None and not cycles.empty:
+        c = cycles[(cycles["n_st"] >= 1) & on_day(cycles["t_unload"])]
+        rel = data.releases[["ts", "robot", "station"]].rename(columns={"ts": "t_rel"}).sort_values("t_rel")
+        c = pd.merge_asof(c.sort_values("t_unload"), rel, left_on="t_unload", right_on="t_rel",
+                          by="robot", direction="backward").dropna(subset=["t_rel"])
+        c = c.merge(data.allocations.sort_values("ts").drop_duplicates("task")[["task", "ts"]]
+                    .rename(columns={"ts": "t_alloc"}), on="task", how="left")
+        c["ret"] = (c["t_unload"] - c["t_rel"]).dt.total_seconds()
+        c["on"] = (c["t_unload"] - c["t_alloc"]).dt.total_seconds().where(lambda s: s.between(0, 3600))
+        c["aisle"] = _rack(c["to_loc"])["aisle"]
+        r = _speed(c[c["ret"].between(0, _RETURN_MAX_S)].dropna(subset=["aisle"]), "ret", ["station", "aisle"])
+        g = c.groupby("robot").agg(cycles=("ret", "size"), on_s=("on", "sum"))
+        gr = r.groupby("robot").agg(ret_s=("act", "sum"), exp_s=("exp", "sum"))
+        for rb in sorted(k50 & (set(g.index) | set(tasks.index)), key=natural_key):
+            rows.append([rb, int(tasks.get(rb, 0)), int(g["cycles"].get(rb, 0)), _r(g["on_s"].get(rb, 0), 0),
+                         _r(gr["ret_s"].get(rb, 0), 0), _r(gr["exp_s"].get(rb, 0), 0)])
+    out["K50"] = rows
+
+    mv = data.moves[data.moves["robot"].isin(acr)]
+    puts = mv[mv["to_loc"].str.contains(BUFFER_ACR, na=False) & ~mv["from_loc"].str.contains("coop", na=False)]
+    puts = puts[on_day(puts["t_load"])].assign(level=lambda x: _rack(x["from_loc"])["level"])
+    puts = puts.assign(s=(puts["t_unload"] - puts["t_load"]).dt.total_seconds()).dropna(subset=["level"])
+    puts = _speed(puts[puts["s"].between(0, _HANDLE_MAX_ROBOT_S)], "s", ["level"])
+    g = puts.groupby("robot").agg(n=("s", "size"), s=("act", "sum"), exp=("exp", "sum"))
+    out["ACR"] = [[rb, int(tasks.get(rb, 0)), int(g["n"].get(rb, 0)), _r(g["s"].get(rb, 0), 0), _r(g["exp"].get(rb, 0), 0)]
+                  for rb in sorted(acr & (set(g.index) | set(tasks.index)), key=natural_key)]
+
+    fl = data.faults
+    fl = fl[on_day(fl["ts"]) & (fl["robot"] != "")] if not fl.empty else fl
+    if not fl.empty:
+        lf = fl[fl["kind"] == "load_failed"]
+        stuck = lf["loc"].value_counts()
+        stuck = set(stuck[stuck >= STUCK_MIN_ATTEMPTS].index)
+        fl = fl[~((fl["kind"] == "load_failed") & fl["loc"].isin(stuck))]
+        fk = fl.assign(fk=_fault_kind(fl["kind"], fl["message"]))
+        fk = fk[fk["fk"] != ""]
+        out["faults"] = {k: {rb: int(n) for rb, n in g_["robot"].value_counts().items()} for k, g_ in fk.groupby("fk")}
+        out["stuck_left_out"] = int(lf["loc"].isin(stuck).sum())
+    else:
+        out["faults"], out["stuck_left_out"] = {}, 0
+    out["speed_cap"] = SPEED_CAP
+    return out if out["K50"] or out["ACR"] else None
+
+
 def _full_hours(hourly: list[dict] | None) -> list[int]:
     """Hours whose K50 cycles reached FULL_HOUR_SHARE of the busiest hour."""
     if not hourly:
@@ -1360,13 +1741,14 @@ def day_base(data: LogData, starved_s: float = STARVED_S_DEFAULT) -> dict:
     if cyc:
         m.update(cyc)
     m["full_hours"] = _full_hours(m.get("hourly"))
-    v_cyc, ho = handovers(data, v, cycles, starved_s)
+    v_cyc, ho_all = handovers(data, v, cycles, starved_s)
+    ho, closed = ho_all[~ho_all["closed"]], ho_all[ho_all["closed"]]
     multi = _multi_station(v_cyc, ho, m["full_hours"])
     if multi:
         m["multi"] = multi
     m["utilization"] = _utilization(data, day, m["full_hours"])
     idle = {role: u.pop("_idle", None) for role, u in m["utilization"].items()}
-    starve = _starvation(data, v_cyc, ho, day, m["full_hours"], stations, idle.get("K50"))
+    starve = _starvation(data, v_cyc, ho, day, m["full_hours"], stations, idle.get("K50"), closed)
     if starve:
         m["starve"] = starve
     flow = _task_flow(data, day, m["full_hours"], stations)
@@ -1375,9 +1757,18 @@ def day_base(data: LogData, starved_s: float = STARVED_S_DEFAULT) -> dict:
     slots = _station_slots(data, day, m["full_hours"], stations)
     if slots:
         m["slots"] = slots
+    k50_time = _k50_time(data, day, cycles, m["full_hours"]) if cycles is not None else None
+    if k50_time:
+        m["k50_time"] = k50_time
     spatial = _spatial(data, day, cycles)
     if spatial:
         m["spatial"] = spatial
+    faults = _faults(data, day)
+    if faults:
+        m["faults"] = faults
+    robots = _robots(data, day, cycles)
+    if robots:
+        m["robots"] = robots
 
     # Presentations per hour over the full-production hours: the like-for-like
     # rate, since breaks and stand-downs would otherwise drag it down.

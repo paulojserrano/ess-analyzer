@@ -25,6 +25,11 @@ DOOR_S_MAX = 60.0
 # this many seconds beyond its median handover (release → next arrival).
 STARVED_S_DEFAULT = 1.0
 STARVED_S_MAX = 600.0
+# A robot held at a station this long before its release means the station was
+# closed (a break, a shift change — the log shows every station released in the
+# same second afterwards).  The gap that follows is the station reopening, not
+# starvation, and is reported apart from it.
+CLOSED_HOLD_S = 600.0
 
 # ── Targets ───────────────────────────────────────────────────────────────────
 # Totes a station is expected to present per hour.  Targets can be set per

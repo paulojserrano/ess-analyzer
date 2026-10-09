@@ -60,7 +60,7 @@ ess_analyzer/
 ## File Descriptions
 
 **`log_parser.py`** — The only ingestion path. `parse_logs(paths)` streams the file(s) once and
-returns a `LogData` with `arrivals`, `releases`, `tote_events`, `moves` and `roles`.
+returns a `LogData` with `arrivals`, `releases`, `tote_events`, `moves`, `exceptions`, `faults` and `roles`.
 Handles `.log` and `.log.gz` transparently (`open_log`). Robot roles come from behaviour, not
 numbering: a robot that reaches a station, reports a HAIFLEX type, or works the haiflex buffer
 is a **K50**; anything else is an **ACR**. `pair_moves(events, load_contains=…)` pairs unloads
@@ -123,8 +123,41 @@ pools one day or the whole run; `robot_k50.stations_hist` is the stations-per-cy
 waiting on an ACR / tote ready, no K50 / K50 to the buffer / carrying the tote / at another
 station — they sum exactly to the wait); K50s already on the way at the release; free K50s and
 ready totes when starvation began; pickup→arrival travel histograms; operator pace before the
-release; time since the station resumed; tasks created per station. Pooled by
+release; starvation by the operator time of the visit just released (`pick`, `PICK_BANDS`); the
+refill time (a starved station's previous arrival → next arrival after a pick under
+`REFILL_PICK_MAX_S`); time since the station resumed; tasks created per station. Pooled by
 `engine.starveStats()`, worded by `engine.starveText()`.
+
+**Closures are not starvation.** `metrics.handovers()` marks a handover `closed` when the leaving
+robot was held over `config.CLOSED_HOLD_S` (a break or shift change — every station is released in
+the same second afterwards) or a `CALLBACK_OF_TASK_EXCEPTION` with `DISABLED_TARGET` for a task
+bound to that station falls in the gap (`_disabled()`). Closed handovers are never `starved`;
+`day_base` passes only the open ones to `multi` and `starve`, and reports the closed ones apart in
+`starve.closed`, per station (`closed_n`, `closed_wait_s`) and per hour (`closed_s`). The hour
+budget's waiting share still includes them.
+
+`faults` — problem locations (`_faults`): K50 buffer pickups *flagged* by a preceding
+`LOCATION_ABNORMAL` / `LOAD_FAILED_COUNT_EXCEEDED_THE_LIMIT` for the same tote and slot (the log has no
+scan events — this is the robot needing extra tries), per slot (aisle × bay; the buffer is one level,
+one deep), per robot and hour, and `repeat` — the next pickup by the same slot (another tote) / tote
+(another slot) / robot after a flagged vs a clean one, which tells a slot problem from a tote label.
+Storage: put-aways by depth and the failed ones; stuck storage slots (`STUCK_MIN_ATTEMPTS`+ failed loads
+in a day) with the ACR time spent on them. Pooled by `engine.faultStats()` (binomial test per slot and
+robot, Bonferroni), worded by `faultText()`, drawn by `faultSection()` under *Rack and buffer locations*.
+
+`robots` — robot health (`_robots`): per robot its tasks, K50 cycles and on-task seconds, a speed index
+(K50 return trip vs the day's median for the same station × buffer aisle; ACR handling vs the median for
+the rack level, as actual/expected sums), and fault counts by kind (`ROBOT_FAULT_KINDS`; failed loads at
+stuck slots left out). `engine.robotStats()` tests each robot against its fleet (Poisson, tasks as the
+exposure), gives each kind a dispersion index (1 = chance) and, over 4+ days, an odd/even-day
+consistency; `robotText()`, `robotSection()` under *Robots*.
+
+`k50_time` — where a K50 cycle's time goes (`_k50_time`): fetch (allocation → buffer pickup) /
+travel / queue / at station (first arrival → last release) / return (→ buffer unload), summing to
+the cycle. Travel is pickup → first arrival capped at the free-flow trip (`FREE_FLOW_Q` of the
+day's trips for that station × buffer aisle); queueing is the rest. Full-production hours; sums
+and histograms, pooled by `engine.cycleTimeStats()`, worded by `engine.cycleTimeText()`, drawn by
+`report.js` `cycleTimeSection()` in the *Robots* category (day and summary).
 
 `spatial` — rack and buffer locations (location codes `HAI-<aisle>-<bay>-<level>_<depth>`): ACR puts by
 storage aisle × level, handling time by level, **aisle crowding** per fleet (allocation → pickup against
@@ -265,6 +298,9 @@ per-station-shifted gaps via `engine.shiftedGaps()` — never a single uniform s
 - Station codes arrive ready-made (`LABOR-7`); there is no coordinate inference. Non-operator
   drop points (`CS-003`, `CS-005`, `CS-006`) are counted and excluded.
 - Buffer tokens: `coop_haiflex` is the K50 buffer, `coop_kubot` the ACR buffer.
+- `CALLBACK_OF_TASK_EXCEPTION` with `message: DISABLED_TARGET` (`taskCode` is a list) means the
+  task's destination station is disabled — parsed into `LogData.exceptions`, used to keep
+  closures out of starvation.
 - `CALLBACK_OF_TASK_ALLOCATED` exists for ND tasks for both fleets; its `stationCode` is the
   K50's destination. ACR stores and relocations are not allocated. There are **no charging or
   maintenance events**: a robot 5+ minutes without a task is "away", most likely charging.
